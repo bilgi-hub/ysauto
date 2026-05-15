@@ -2490,6 +2490,7 @@ async def list_vehicles(user: dict = Depends(require_customer)):
         current_rez = None  # Şu an kirada
         next_rez = None  # En yakın gelecek rez
         prev_end = None  # En son biten rez bitişi (geçmiş, son 24 saat içinde)
+        overdue_rez = None  # 🆕 Bitiş tarihi 5+ dakika geçmiş ama hala aktif (teslim edilmedi)
         for r in active_rezler:
             try:
                 bas = parse_iso(r["baslangic_tarihi"])
@@ -2505,7 +2506,13 @@ async def list_vehicles(user: dict = Depends(require_customer)):
                 # Son 24 saat içinde biten
                 if prev_end is None or bit > parse_iso(prev_end):
                     prev_end = bit.isoformat()
+            # 🆕 GECİKMİŞ TESLİM: 5+ dakika geçmiş hala aktif rez
+            if bit < now_utc - _td(minutes=5):
+                if overdue_rez is None or bit > parse_iso(overdue_rez["bit"]):
+                    overdue_rez = {"bit": bit.isoformat()}
         # Durum hesabı: kirada > yıkamada > musait
+        # NOT: Gecikmiş teslim ana sayfada "yıkamada" olarak görünür (kullanıcı talebi).
+        # Engelleme rezervasyon oluşturma anında 423 hatası ile yapılır.
         availability_status = "musait"
         availability_info = {}
         if current_rez:
@@ -2918,6 +2925,20 @@ async def create_reservation(body: ReservationCreate, user: dict = Depends(requi
     if durum != "musait":
         raise HTTPException(400, f"Bu araç şu anda {durum} durumunda")
 
+    # 🆕 GECİKMİŞ TESLİM kontrolü: Önceki müşteri henüz aracı teslim etmediyse yeni rezervasyon engelle
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td_local
+    now_utc_check = _dt.now(_tz.utc)
+    overdue_check = await db.reservations.find_one({
+        "vehicle_id": v["id"],
+        "durum": {"$in": ["aktif", "onaylandi"]},
+        "bitis_tarihi": {"$lt": (now_utc_check - _td_local(minutes=5)).isoformat()},
+    })
+    if overdue_check:
+        raise HTTPException(
+            423,  # Locked
+            "Bu araç rezervasyon anlaşmasının dışına çıkmış ve henüz teslim edilmemiş. Lütfen firma ile iletişime geçin."
+        )
+
     bas = parse_iso(body.baslangic_tarihi)
     bit = parse_iso(body.bitis_tarihi)
     if bit <= bas:
@@ -3092,11 +3113,11 @@ async def my_reservations(user: dict = Depends(require_customer), durum: Optiona
 
 @api.get("/reservations/active")
 async def my_active(user: dict = Depends(require_customer)):
-    now = now_iso()
+    # 🆕 Durumu baz al — bitiş tarihi geçmiş olsa bile durum 'aktif'/'onaylandi' ise hala aktif sayılır
+    # (admin 'tamamlandi' yapana kadar)
     r = await db.reservations.find_one({
         "customer_id": user["id"],
         "durum": {"$in": ["onaylandi", "aktif"]},
-        "bitis_tarihi": {"$gte": now},
     }, {"_id": 0}, sort=[("baslangic_tarihi", 1)])
     if not r:
         r = await db.reservations.find_one({
