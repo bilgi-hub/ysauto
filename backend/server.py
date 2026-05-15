@@ -424,9 +424,20 @@ def hhmm_to_tuple(s: str) -> tuple:
     except Exception:
         return 9, 0
 
+# ⚡ PERFORMANS: Settings 60 saniyelik cache — her istekte DB sorgusu yapılmasın
+import time as _time
+_settings_cache: dict = {}
+_settings_cache_ts: float = 0.0
+
 async def get_settings() -> dict:
+    global _settings_cache, _settings_cache_ts
+    now_ts = _time.monotonic()
+    if now_ts - _settings_cache_ts < 60 and _settings_cache:
+        return _settings_cache
     s = await db.settings.find_one({"key": "company"}, {"_id": 0})
-    return s or {}
+    _settings_cache = s or {}
+    _settings_cache_ts = now_ts
+    return _settings_cache
 
 # ==================== AI DEKONT DOĞRULAMA ====================
 EMERGENT_LLM_KEY = os.getenv("EMERGENT_LLM_KEY", "")
@@ -2147,12 +2158,16 @@ async def customer_login(body: CustomerLoginIn):
             raise HTTPException(400, "Telefon numarası geçersiz (10 haneli olmalı)")
         cust = await db.customers.find_one({"telefon_norm": phone_norm}, {"_id": 0})
         if not cust:
-            # Geri uyumluluk: telefon_norm yoksa eski 'telefon' alanını taraması
-            all_custs = await db.customers.find({}, {"_id": 0}).to_list(2000)
-            for c in all_custs:
+            # ⚡ PERFORMANS: Geri uyumluluk — tüm müşteri yerine son 4 hane regex ile filtrele
+            _last4 = phone_norm[-4:] if len(phone_norm) >= 4 else phone_norm
+            _candidates = await db.customers.find(
+                {"telefon": {"$regex": _last4}},
+                {"_id": 0},
+            ).to_list(50)
+            for c in _candidates:
                 if normalize_phone(c.get("telefon", "")) == phone_norm:
                     cust = c
-                    # Geri yazıp arama hızlansın
+                    # Geri yazıp bir daha buraya düşmesin
                     await db.customers.update_one({"id": c["id"]}, {"$set": {"telefon_norm": phone_norm}})
                     break
         if not cust:
@@ -2485,7 +2500,7 @@ async def list_vehicles(user: dict = Depends(require_customer)):
 
     out = []
     for v in docs:
-        v["durum"] = await compute_vehicle_status(v)
+        # ⚡ N+1 FIX: compute_vehicle_status kaldırıldı — rezervasyon map'inden türet (0 ekstra sorgu)
         active_rezler = rez_by_vehicle.get(v["id"], [])
         current_rez = None  # Şu an kirada
         next_rez = None  # En yakın gelecek rez
@@ -2527,6 +2542,8 @@ async def list_vehicles(user: dict = Depends(require_customer)):
                 availability_info["ready_at"] = cleaning_done_at.isoformat()
                 availability_info["dakika_kaldi"] = max(0, int((cleaning_done_at - now_utc).total_seconds() / 60))
             # else: zaten 1 saat geçmiş, müsait
+        # ⚡ durum: manuel_durum varsa onu kullan, yoksa rezervasyon durumundan türet
+        v["durum"] = v.get("manuel_durum") or ("dolu" if current_rez else "musait")
         v["availability_status"] = availability_status
         v["availability_info"] = availability_info
         v["next_reservation_at"] = next_rez["bas"] if next_rez else None
@@ -4386,11 +4403,19 @@ async def admin_vehicles_available(
     # Tüm araçları çek
     vehicles = await db.vehicles.find({}, {"_id": 0}).sort([("siralama", 1), ("created_at", -1)]).to_list(200)
 
-    # Aktif/onaylı rezervasyonları çek
+    # ⚡ PERFORMANS: Tarih filtresiyle sınırlı rezervasyon sorgusu (length=None kaldırıldı)
+    # 30 gün öncesi–60 gün sonrası penceresi: admin paneli için yeterli, tüm koleksiyonu çekmez
+    from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
+    _fetch_from = (window_start - _td2(days=30)).isoformat()
+    _fetch_to   = (window_end   + _td2(days=60)).isoformat()
     reservations = await db.reservations.find(
-        {"durum": {"$in": ["aktif", "onaylandi"]}},
-        {"_id": 0, "vehicle_id": 1, "baslangic_tarihi": 1, "bitis_tarihi": 1, "durum": 1, "vehicle_snapshot": 1},
-    ).to_list(length=None)
+        {
+            "durum": {"$in": ["aktif", "onaylandi"]},
+            "bitis_tarihi":    {"$gte": _fetch_from},
+            "baslangic_tarihi": {"$lte": _fetch_to},
+        },
+        {"_id": 0, "vehicle_id": 1, "baslangic_tarihi": 1, "bitis_tarihi": 1, "durum": 1},
+    ).to_list(2000)
 
     # Araç bazlı rezervasyon haritası
     res_by_vehicle: dict = {}
@@ -4481,10 +4506,17 @@ async def admin_vehicles_available_at(
     mesai_baslangic = s.get("mesai_baslangic", "09:00")
 
     vehicles = await db.vehicles.find({}, {"_id": 0}).sort([("siralama", 1), ("created_at", -1)]).to_list(200)
+    # ⚡ PERFORMANS: Tarih filtresiyle sınırlı sorgu — tüm koleksiyon çekilmiyor
+    _at_from = (target_utc - _td(days=30)).isoformat()
+    _at_to   = (target_utc + _td(days=60)).isoformat()
     reservations = await db.reservations.find(
-        {"durum": {"$in": ["aktif", "onaylandi"]}},
+        {
+            "durum": {"$in": ["aktif", "onaylandi"]},
+            "bitis_tarihi":     {"$gte": _at_from},
+            "baslangic_tarihi": {"$lte": _at_to},
+        },
         {"_id": 0, "vehicle_id": 1, "baslangic_tarihi": 1, "bitis_tarihi": 1, "durum": 1},
-    ).to_list(length=None)
+    ).to_list(2000)
 
     res_by_vehicle: dict = {}
     for r in reservations:
@@ -4651,8 +4683,17 @@ async def admin_quote(
 @api.get("/admin/vehicles")
 async def admin_list_vehicles(_: dict = Depends(require_admin)):
     docs = await db.vehicles.find({}, {"_id": 0}).sort([("siralama", 1), ("created_at", -1)]).to_list(200)
+    # ⚡ N+1 FIX: Tüm aktif rez'leri tek sorguda çek — araç başına ayrı sorgu yok
+    _now_str = now_iso()
+    _active_rez = await db.reservations.find(
+        {"durum": {"$in": ["onaylandi", "aktif"]},
+         "baslangic_tarihi": {"$lte": _now_str},
+         "bitis_tarihi":     {"$gte": _now_str}},
+        {"_id": 0, "vehicle_id": 1},
+    ).to_list(500)
+    _dolu_ids = {r["vehicle_id"] for r in _active_rez}
     for v in docs:
-        v["durum"] = await compute_vehicle_status(v)
+        v["durum"] = v.get("manuel_durum") or ("dolu" if v.get("id") in _dolu_ids else "musait")
         # GPS bot'tan canlı KM al — bot offline ise saklı mevcut_km değerini kullan (mock fallback)
         try:
             live = await get_live_vehicle(v.get("plaka", ""))
@@ -4777,11 +4818,17 @@ async def admin_motor_blokaj(vid: str, body: MotorBlokajIn, _: dict = Depends(re
 
 # ==================== ADMIN: Reservations ====================
 @api.get("/admin/reservations")
-async def admin_list_reservations(_: dict = Depends(require_admin), durum: Optional[str] = None):
-    q = {}
+async def admin_list_reservations(
+    _: dict = Depends(require_admin),
+    durum: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=500),
+    skip: int = Query(0, ge=0),
+):
+    # ⚡ PERFORMANS: Sayfalama eklendi (varsayılan 200, max 500). Durum filtresi ile aktif rez'ler önce gelir.
+    q: dict = {}
     if durum:
         q["durum"] = durum
-    docs = await db.reservations.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+    docs = await db.reservations.find(q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     # ⚡ N+1 fix: Tüm müşterileri TEK sorguda çek
     customer_ids = list({r["customer_id"] for r in docs if r.get("customer_id")})
     customers = await db.customers.find(
@@ -5879,10 +5926,15 @@ async def admin_reject_topup(tx_id: str, _: dict = Depends(require_admin)):
 @api.get("/admin/wallet-tx/pending")
 async def admin_pending_topups(_: dict = Depends(require_admin)):
     docs = await db.wallet_tx.find({"tip": "yukleme_beklemede", "durum": "beklemede"}, {"_id": 0}).sort("tarih", -1).to_list(100)
-    for d in docs:
-        c = await db.customers.find_one({"id": d["customer_id"]}, {"_id": 0, "ad": 1, "soyad": 1})
-        if c:
-            d["musteri_adi"] = f"{c['ad']} {c['soyad']}"
+    # ⚡ N+1 FIX: Tüm müşterileri tek sorguda çek
+    _cids = list({d["customer_id"] for d in docs if d.get("customer_id")})
+    if _cids:
+        _custs = await db.customers.find({"id": {"$in": _cids}}, {"_id": 0, "id": 1, "ad": 1, "soyad": 1}).to_list(len(_cids) + 5)
+        _cust_map = {c["id"]: c for c in _custs}
+        for d in docs:
+            c = _cust_map.get(d.get("customer_id"))
+            if c:
+                d["musteri_adi"] = f"{c['ad']} {c['soyad']}"
     return docs
 
 # ==================== ADMIN: Services ====================
@@ -6566,7 +6618,11 @@ async def admin_cashflow(
     konsinye_devlet_total = 0.0  # devlet kesintisi YS Auto'da kalır (vergi rezervi)
     konsinye_rez_sayisi = 0
     try:
-        completed_rez = await db.reservations.find({"durum": "tamamlandi"}, {"_id": 0}).to_list(5000)
+        # ⚡ PERFORMANS: Projeksiyon ile sadece gerekli alanları çek
+        completed_rez = await db.reservations.find(
+            {"durum": "tamamlandi"},
+            {"_id": 0, "id": 1, "vehicle_id": 1, "toplam_tutar": 1, "baslangic_tarihi": 1, "bitis_tarihi": 1, "gun_sayisi": 1, "toplam_gun": 1, "arac_toplam": 1, "uzatma_arac_tutar": 1, "ek_km_satin_alim_tutar": 1},
+        ).to_list(5000)
         for r in completed_rez:
             earn = await calculate_konsinye_earning_for_reservation(r)
             if earn:
@@ -6795,6 +6851,15 @@ async def admin_earnings(
         reservations = await db.reservations.find(res_query, {"_id": 0}).sort("bitis_tarihi", -1).to_list(1000)
     expenses = await db.expenses.find(exp_query, {"_id": 0}).sort("tarih", -1).to_list(1000)
     manual_incomes = await db.manual_incomes.find(mi_query, {"_id": 0}).sort("tarih", -1).to_list(1000)
+    # ⚡ N+1 FIX: cashflow döngüsü için müşterileri önceden tek sorguda yükle
+    _cf_cust_ids = list({r.get("customer_id") for r in reservations if r.get("customer_id")})
+    _cf_cust_map: dict = {}
+    if _cf_cust_ids:
+        _cf_custs = await db.customers.find(
+            {"id": {"$in": _cf_cust_ids}},
+            {"_id": 0, "id": 1, "ad": 1, "soyad": 1},
+        ).to_list(len(_cf_cust_ids) + 10)
+        _cf_cust_map = {c["id"]: c for c in _cf_custs}
 
     # Dönem sınırları (UTC datetime)
     period_start = parse_iso(f"{start}T00:00:00.000Z") if start else None
@@ -6852,8 +6917,9 @@ async def admin_earnings(
         else:
             diger_rentcar_gelir += ys_pay_amt
         snap = r.get("vehicle_snapshot") or {}
-        cust = await db.customers.find_one({"id": r.get("customer_id")}, {"_id": 0, "ad": 1, "soyad": 1})
-        musteri = f"{(cust or {}).get('ad', '')} {(cust or {}).get('soyad', '')}".strip() or "—"
+        # ⚡ N+1 FIX: find_one kaldırıldı → önceden yüklenen map kullanılıyor
+        _cf_c = _cf_cust_map.get(r.get("customer_id"))
+        musteri = f"{(_cf_c or {}).get('ad', '')} {(_cf_c or {}).get('soyad', '')}".strip() or "—"
 
         # Detay: çoklu aya yayıldıysa breakdown
         breakdown = None
@@ -7275,7 +7341,7 @@ async def _create_giden_fatura(reservation: dict) -> Optional[dict]:
     # Bu rezervasyonun mevcut faturalarını topla
     existing_invs = await db.invoices.find(
         {"reservation_id": rid, "tip": "giden"}, {"_id": 0}
-    ).sort("created_at", 1).to_list(length=None)
+    ).sort("created_at", 1).to_list(20)  # ⚡ Tek rezervasyona ait fatura sayısı zaten sınırlı
     invoiced_days = sum(int(inv.get("miktar") or 0) for inv in existing_invs)
 
     # Delta: henüz faturalanmamış günler
@@ -7375,11 +7441,16 @@ async def admin_regenerate_invoices(
         {"durum": {"$in": ["onaylandi", "aktif", "tamamlandi"]}},
         {"_id": 0},
     ).to_list(10000)
+    # ⚡ N+1 FIX: Mevcut giden faturaların reservation_id setini tek sorguda çek
+    _existing_inv_docs = await db.invoices.find(
+        {"tip": "giden"},
+        {"_id": 0, "reservation_id": 1},
+    ).to_list(10000)
+    _already_invoiced: set = {d["reservation_id"] for d in _existing_inv_docs if d.get("reservation_id")}
     created = 0
     skipped = 0
     for r in reservations:
-        existing = await db.invoices.find_one({"reservation_id": r["id"], "tip": "giden"})
-        if existing:
+        if r["id"] in _already_invoiced:
             skipped += 1
             continue
         result = await _create_giden_fatura(r)
@@ -8152,6 +8223,19 @@ async def _build_konsinye_report(konsinye_sahibi_id: str, mask_customer: bool = 
 
     # 🚀 PERFORMANS — vehicle map'i kullanarak DB sorgusu olmadan hızlı hesap
     v_map = {v["id"]: v for v in my_vehicles}
+    # ⚡ N+1 FIX: mask_customer=False modunda müşteri adlarını TEK sorguda çek
+    _customer_name_map: dict = {}
+    if not mask_customer:
+        _cust_ids = list({r.get("customer_id") for r in rez_list if r.get("customer_id")})
+        if _cust_ids:
+            _cust_docs = await db.customers.find(
+                {"id": {"$in": _cust_ids}},
+                {"_id": 0, "id": 1, "ad": 1, "soyad": 1},
+            ).to_list(len(_cust_ids) + 10)
+            _customer_name_map = {
+                c["id"]: f"{c.get('ad', '')} {c.get('soyad', '')}".strip()
+                for c in _cust_docs
+            }
     for r in rez_list:
         earn = await calculate_konsinye_earning_for_reservation(r, vehicle=v_map.get(r.get("vehicle_id")))
         if not earn:
@@ -8180,10 +8264,10 @@ async def _build_konsinye_report(konsinye_sahibi_id: str, mask_customer: bool = 
         toplam_devlet += earn["devlet_kesinti"]
         toplam_hakkedis += earn["sahibin_hakkedisi"]
         toplam_gun += earn["gun_sayisi"]
-        v = next((vv for vv in my_vehicles if vv["id"] == r["vehicle_id"]), None)
+        v = v_map.get(r.get("vehicle_id"))
         detayli_rez.append({
             "id": r["id"],
-            "musteri": _anonim_musteri_id(r.get("customer_id")) if mask_customer else f"{(await db.customers.find_one({'id': r.get('customer_id')}, {'_id': 0, 'ad': 1, 'soyad': 1, 'telefon': 1}) or {}).get('ad', '')} {(await db.customers.find_one({'id': r.get('customer_id')}, {'_id': 0, 'ad': 1, 'soyad': 1}) or {}).get('soyad', '')}".strip() or _anonim_musteri_id(r.get("customer_id")),
+            "musteri": _anonim_musteri_id(r.get("customer_id")) if mask_customer else _customer_name_map.get(r.get("customer_id")) or _anonim_musteri_id(r.get("customer_id")),
             "arac_plaka": v["plaka"] if v else "—",
             "arac_marka_model": f"{v.get('marka', '')} {v.get('model', '')}" if v else "—",
             "baslangic_tarihi": r.get("baslangic_tarihi"),
