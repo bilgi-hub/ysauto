@@ -1185,8 +1185,22 @@ async def fetch_bot_vehicles() -> Optional[List[dict]]:
         logger.info(f"Bot offline (mock fallback): {e}")
     return None
 
+# ⚡ Bot veri cache — admin/vehicles gibi list endpoint'lerinde 20 araç için 20 ayrı bot çağrısı yapılmasını engeller
+_bot_cache: dict = {"data": None, "expires_at": 0.0}
+async def fetch_bot_vehicles_cached(ttl_sec: float = 5.0) -> Optional[List[dict]]:
+    """fetch_bot_vehicles() çıktısını N saniye memory'de tutar. Periodic sync ve admin liste sayfası için ideal."""
+    import time
+    now = time.time()
+    if _bot_cache["data"] is not None and _bot_cache["expires_at"] > now:
+        return _bot_cache["data"]
+    data = await fetch_bot_vehicles()
+    if data is not None:
+        _bot_cache["data"] = data
+        _bot_cache["expires_at"] = now + ttl_sec
+    return data
+
 async def get_live_vehicle(plaka: str) -> Optional[dict]:
-    vs = await fetch_bot_vehicles()
+    vs = await fetch_bot_vehicles_cached()
     if not vs:
         return None
     np = (plaka or "").replace(" ", "").upper()
@@ -1688,6 +1702,67 @@ async def ensure_indexes():
                 name="idx_odeme_sahibi_donem", background=True)
         except Exception:
             pass
+
+        # ⚡ HIZ OPTİMİZASYONU — Ek index'ler (Mayıs 2026)
+        try:
+            # TENANT_ID compound — multi-tenant query'lerde devasa hız farkı yaratır
+            await db.vehicles.create_index(
+                [("tenant_id", 1), ("siralama", 1)],
+                name="idx_vehicles_tenant_sira", sparse=True, background=True)
+            await db.customers.create_index(
+                [("tenant_id", 1), ("created_at", -1)],
+                name="idx_customers_tenant_created", sparse=True, background=True)
+            await db.customers.create_index(
+                [("tenant_id", 1), ("tip", 1)],
+                name="idx_customers_tenant_tip", sparse=True, background=True)
+            await db.reservations.create_index(
+                [("tenant_id", 1), ("durum", 1), ("baslangic_tarihi", 1)],
+                name="idx_rez_tenant_durum_basl", sparse=True, background=True)
+
+            # NOTIFICATIONS — admin bildirim listesi sıralaması (tarih DESC)
+            await db.notifications.create_index(
+                [("hedef_type", 1), ("tarih", -1)],
+                name="idx_notif_hedef_tarih", background=True)
+            await db.notifications.create_index(
+                [("tarih", -1)],
+                name="idx_notif_tarih", background=True)
+
+            # WALLET_TX — tarih bazlı sıralama (admin listesi)
+            await db.wallet_tx.create_index(
+                [("tarih", -1)],
+                name="idx_wallettx_tarih", background=True)
+            await db.wallet_tx.create_index(
+                [("durum", 1), ("tarih", -1)],
+                name="idx_wallettx_durum_tarih", sparse=True, background=True)
+
+            # RESERVATIONS — kaynak (bot/manuel) bazlı listeleme
+            await db.reservations.create_index(
+                [("kaynak", 1), ("durum", 1)],
+                name="idx_rez_kaynak_durum", sparse=True, background=True)
+            # Aktif rezervasyonu olan araç sorgusu için
+            await db.reservations.create_index(
+                [("durum", 1), ("vehicle_id", 1)],
+                name="idx_rez_durum_vehicle", background=True)
+
+            # CUSTOMERS — admin liste sayfasında full-text yerine prefix arama hızı
+            await db.customers.create_index(
+                [("ad", 1)], name="idx_customers_ad", sparse=True, background=True)
+            await db.customers.create_index(
+                [("soyad", 1)], name="idx_customers_soyad", sparse=True, background=True)
+
+            # VEHICLES — admin liste filtre & sıralama
+            await db.vehicles.create_index(
+                [("kaynak", 1)], name="idx_vehicles_kaynak", sparse=True, background=True)
+
+            # DEKONTLAR — admin dekont liste
+            await db.dekontlar.create_index(
+                [("durum", 1), ("tarih", -1)],
+                name="idx_dekontlar_durum_tarih", sparse=True, background=True)
+            await db.dekontlar.create_index(
+                [("customer_id", 1), ("tarih", -1)],
+                name="idx_dekontlar_customer_tarih", sparse=True, background=True)
+        except Exception as e:
+            logger.error(f"⚠️ Ek index oluşturma hatası: {e}")
 
         logger.info("✅ MongoDB index'leri kontrol edildi/oluşturuldu")
     except Exception as e:
@@ -2284,6 +2359,9 @@ async def download_source_public(token: str = "", kind: str = "full"):
     if kind == "minimal":
         path = "/app/backend/downloads/ysauto_minimal.zip"
         fname = "ysauto_minimal.zip"
+    elif kind == "backup":
+        path = "/app/backend/downloads/ysauto_full_backup.zip"
+        fname = "ysauto_full_backup.zip"
     else:
         path = "/app/backend/downloads/ysauto_source.zip"
         fname = "ysauto_source.zip"
@@ -2385,21 +2463,30 @@ async def admin_send_test_push(user: dict = Depends(require_admin)):
 # ==================== CUSTOMER: Vehicles ====================
 @api.get("/vehicles")
 async def list_vehicles(user: dict = Depends(require_customer)):
-    docs = await db.vehicles.find({}, {"_id": 0}).sort([("siralama", 1), ("gunluk_fiyat", 1)]).to_list(200)
+    # ⚡ Liste yanıtında BÜYÜK alanları HARİÇ tut (fotograflar detayda yüklenir)
+    proj = {"_id": 0, "fotograflar": 0, "aciklama_detay": 0, "kontrat_html": 0}
+    docs = await db.vehicles.find({}, proj).sort([("siralama", 1), ("gunluk_fiyat", 1)]).to_list(200)
     # Mesai başı saatini ve TR saatini al
     s = await get_settings()
     mesai_baslangic = s.get("mesai_baslangic", "09:00")
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     now_utc = _dt.now(_tz.utc)
+
+    # ⚡ N+1 fix: Tüm araçların aktif rezervasyonlarını TEK sorguda çek
+    vehicle_ids = [v["id"] for v in docs]
+    all_active_rezler = await db.reservations.find(
+        {"vehicle_id": {"$in": vehicle_ids}, "durum": {"$in": ["aktif", "onaylandi"]}},
+        {"_id": 0, "vehicle_id": 1, "baslangic_tarihi": 1, "bitis_tarihi": 1},
+    ).to_list(2000)
+    # vehicle_id'ye göre grupla
+    rez_by_vehicle: dict[str, list] = {}
+    for r in all_active_rezler:
+        rez_by_vehicle.setdefault(r["vehicle_id"], []).append(r)
+
     out = []
     for v in docs:
         v["durum"] = await compute_vehicle_status(v)
-        # Her araç için müsaitlik bilgisi: kirada / yıkamada / müsait
-        # En son biten ve henüz başlamamış aktif rezervasyonları çek
-        active_rezler = await db.reservations.find(
-            {"vehicle_id": v["id"], "durum": {"$in": ["aktif", "onaylandi"]}},
-            {"_id": 0, "baslangic_tarihi": 1, "bitis_tarihi": 1},
-        ).to_list(100)
+        active_rezler = rez_by_vehicle.get(v["id"], [])
         current_rez = None  # Şu an kirada
         next_rez = None  # En yakın gelecek rez
         prev_end = None  # En son biten rez bitişi (geçmiş, son 24 saat içinde)
@@ -4009,10 +4096,16 @@ async def admin_list_customers(_: dict = Depends(require_admin), q: Optional[str
     elif filtre == "bireysel":
         query["tip"] = {"$in": ["bireysel", None]}
     docs = await db.customers.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
+    # ⚡ N+1 fix: Tüm wallet'ları TEK sorguda çek
+    customer_ids = [d["id"] for d in docs]
+    wallets = await db.wallets.find(
+        {"customer_id": {"$in": customer_ids}},
+        {"_id": 0, "customer_id": 1, "bakiye": 1},
+    ).to_list(len(customer_ids) + 10)
+    wallet_by_cid = {w["customer_id"]: w.get("bakiye", 0.0) for w in wallets}
     for d in docs:
         d["tc_masked"] = (d.get("tc_norm", "") or "")[:3] + "*****" + (d.get("tc_norm", "") or "")[-2:]
-        w = await db.wallets.find_one({"customer_id": d["id"]}, {"_id": 0, "bakiye": 1})
-        d["bakiye"] = (w or {}).get("bakiye", 0.0)
+        d["bakiye"] = wallet_by_cid.get(d["id"], 0.0)
     return docs
 
 @api.post("/admin/customers")
@@ -4562,10 +4655,22 @@ async def admin_list_reservations(_: dict = Depends(require_admin), durum: Optio
     if durum:
         q["durum"] = durum
     docs = await db.reservations.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+    # ⚡ N+1 fix: Tüm müşterileri TEK sorguda çek
+    customer_ids = list({r["customer_id"] for r in docs if r.get("customer_id")})
+    customers = await db.customers.find(
+        {"id": {"$in": customer_ids}},
+        {"_id": 0, "id": 1, "ad": 1, "soyad": 1, "telefon": 1, "tc_norm": 1},
+    ).to_list(len(customer_ids) + 10) if customer_ids else []
+    cust_by_id = {c["id"]: c for c in customers}
     for r in docs:
-        c = await db.customers.find_one({"id": r["customer_id"]}, {"_id": 0, "ad": 1, "soyad": 1, "telefon": 1, "tc_norm": 1})
+        c = cust_by_id.get(r.get("customer_id"))
         if c:
-            r["musteri"] = {"ad": c["ad"], "soyad": c["soyad"], "telefon": c.get("telefon"), "tc_masked": (c.get("tc_norm", "") or "")[:3] + "*****" + (c.get("tc_norm", "") or "")[-2:]}
+            r["musteri"] = {
+                "ad": c["ad"],
+                "soyad": c["soyad"],
+                "telefon": c.get("telefon"),
+                "tc_masked": (c.get("tc_norm", "") or "")[:3] + "*****" + (c.get("tc_norm", "") or "")[-2:],
+            }
     return docs
 
 @api.put("/admin/reservations/{rid}/durum")
