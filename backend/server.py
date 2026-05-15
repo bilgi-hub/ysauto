@@ -3158,99 +3158,27 @@ async def extend_reservation(rid: str, body: ReservationExtend, user: dict = Dep
     r = await db.reservations.find_one({"id": rid, "customer_id": user["id"]}, {"_id": 0})
     if not r:
         raise HTTPException(404, "Rezervasyon bulunamadı")
-    return await _extend_logic(r, body, charge_balance=True)
+    return await _extend_logic(r, body, charge_balance=True, user_id=user["id"])
 
 @api.post("/admin/reservations/{rid}/extend-quote")
 async def admin_extend_quote(rid: str, body: ExtendQuoteIn, _: dict = Depends(require_admin)):
-    """Admin için süre uzatma teklif (fiyat hesabı). Müşteriye eklenecek tutarı döner."""
+    """Admin için süre uzatma teklif (fiyat hesabı). Müşterinin tarafındaki ile AYNI mantık kullanır
+    (kademe fiyat + süre indirimi + ek hizmet + ek KM). Bakiye kontrolü yapılmaz (admin kararı)."""
     r = await db.reservations.find_one({"id": rid}, {"_id": 0})
     if not r:
         raise HTTPException(404, "Rezervasyon bulunamadı")
-    return await _admin_extend_quote_logic(r, body)
+    return await _compute_extend_quote(r, body, check_balance=False)
 
-@api.post("/admin/reservations/{rid}/extend")
-async def admin_extend_reservation(rid: str, body: ReservationExtend, _: dict = Depends(require_admin)):
-    """Admin manuel süre uzatma — kademe/indirim sistemi uygulanır.
-    Müşteri bakiyesinden ÇEKMEZ, sadece rezervasyon kalan ödemesine eklenir."""
-    r = await db.reservations.find_one({"id": rid}, {"_id": 0})
-    if not r:
-        raise HTTPException(404, "Rezervasyon bulunamadı")
-    if r["durum"] not in ("onaylandi", "aktif"):
-        raise HTTPException(400, "Sadece aktif/onaylı rezervasyonlar uzatılabilir")
-    eski_bit = parse_iso(r["bitis_tarihi"])
-    yeni_bit = parse_iso(body.yeni_bitis_tarihi)
-    if yeni_bit <= eski_bit:
-        raise HTTPException(400, "Yeni bitiş tarihi mevcut bitiş tarihinden sonra olmalı")
-    # araç çakışması kontrolü
-    conflict = await db.reservations.find_one({
-        "vehicle_id": r["vehicle_id"],
-        "id": {"$ne": rid},
-        "durum": {"$in": ["beklemede", "onaylandi", "aktif"]},
-        "$expr": {"$and": [
-            {"$lt": ["$baslangic_tarihi", yeni_bit.isoformat()]},
-            {"$gt": ["$bitis_tarihi", eski_bit.isoformat()]},
-        ]},
-    }, {"_id": 0, "id": 1})
-    if conflict:
-        raise HTTPException(409, "Bu tarihte araç başka bir rezervasyonla çakışıyor")
-    # quote hesapla
-    quote = await _admin_extend_quote_logic(r, ExtendQuoteIn(yeni_bitis_tarihi=body.yeni_bitis_tarihi, secilen_hizmetler=[], ek_km=0))
-    yeni_arac_tutari = round(float(r.get("arac_tutari", 0) or 0) + float(quote["arac_fark"] or 0), 2)
-    yeni_toplam = round(float(r.get("toplam_tutar", 0) or 0) + float(quote["toplam_ek_ucret"] or 0), 2)
-    yeni_kalan = round(float(r.get("kalan_odeme", 0) or 0) + float(quote["toplam_ek_ucret"] or 0), 2)
-    yeni_gun = int(quote["yeni_toplam_gun"])
-    # paket KM'yi de yeni gün sayısına göre yeniden hesaplayalım
-    v = await db.vehicles.find_one({"id": r["vehicle_id"]}, {"_id": 0}) if r.get("vehicle_id") else None
-    yeni_paket_km = paket_km_for(v, yeni_gun) if v else int(r.get("paket_km", 0) or 0)
-    await db.reservations.update_one({"id": rid}, {"$set": {
-        "bitis_tarihi": yeni_bit.isoformat(),
-        "gun": yeni_gun,
-        "arac_tutari": yeni_arac_tutari,
-        "toplam_tutar": yeni_toplam,
-        "kalan_odeme": yeni_kalan,
-        "paket_km": yeni_paket_km,
-        "uzatma_tarihi": now_iso(),
-    }})
-    # bildirim
-    try:
-        await notify_customer(
-            r["customer_id"],
-            "Süre Uzatıldı",
-            f"Rezervasyonunuzun süresi {yeni_gun} güne uzatıldı. Yeni bitiş: {yeni_bit.strftime('%d.%m.%Y %H:%M')}. Eklenen tutar: {quote['toplam_ek_ucret']:.2f}₺",
-            {"type": "reservation_extended", "reservation_id": rid},
-        )
-    except Exception:
-        pass
-    return {"ok": True, **quote, "yeni_bitis_tarihi": yeni_bit.isoformat()}
-
-async def _admin_extend_quote_logic(r: dict, body: ExtendQuoteIn) -> dict:
-    """Ortak quote hesabı — kademe fiyat ile."""
-    eski_bit = parse_iso(r["bitis_tarihi"])
-    yeni_bit = parse_iso(body.yeni_bitis_tarihi)
-    if yeni_bit <= eski_bit:
-        raise HTTPException(400, "Yeni bitiş tarihi mevcut bitiş tarihinden sonra olmalı")
-    eski_bas = parse_iso(r["baslangic_tarihi"])
-    eski_gun = max(1, int((eski_bit - eski_bas).total_seconds() // 86400) or 1)
-    total_sec = (yeni_bit - eski_bas).total_seconds()
-    yeni_toplam_gun = max(eski_gun + 1, int(total_sec // 86400) + (1 if total_sec % 86400 > 0 else 0))
-    ek_gun = yeni_toplam_gun - eski_gun
-    v = await db.vehicles.find_one({"id": r.get("vehicle_id")}, {"_id": 0}) if r.get("vehicle_id") else None
-    # kademe fiyat (varsa)
-    try:
-        yeni_birim = await get_tiered_daily_price(v, yeni_toplam_gun) if v else float((r.get("vehicle_snapshot") or {}).get("gunluk_fiyat", 0) or 0)
-    except Exception:
-        yeni_birim = float(v.get("gunluk_fiyat", 0) or 0) if v else float((r.get("vehicle_snapshot") or {}).get("gunluk_fiyat", 0) or 0)
-    eski_arac = float(r.get("arac_tutari", 0) or 0)
-    yeni_arac = round(yeni_birim * yeni_toplam_gun, 2)
-    arac_fark = round(yeni_arac - eski_arac, 2)
-    toplam_ek = round(arac_fark, 2)
-    return {
-        "ek_gun": ek_gun,
-        "yeni_toplam_gun": yeni_toplam_gun,
-        "yeni_birim_fiyat": yeni_birim,
-        "arac_fark": arac_fark,
-        "toplam_ek_ucret": toplam_ek,
-    }
+# ==================== ORTAK: Süre Uzatma Hesabı ====================
+async def _compute_extend_quote(r: dict, body: ExtendQuoteIn, check_balance: bool = True) -> dict:
+    """Müşteri ve admin tarafı için ortak süre uzatma fiyat hesabı.
+    - Kademe fiyat (gunluk_fiyat_kademeleri) → yeni toplam gün için
+    - Süre indirimi → eski indirim ile fark
+    - Ek hizmetler (zorunlu hariç)
+    - Ek KM satın alma + hacim indirimi
+    - Bakiye kontrolü (sadece check_balance=True ise)
+    - Tatil/mesai/çakışma kontrolleri
+    """
     if r["durum"] not in ("onaylandi", "aktif"):
         raise HTTPException(400, "Sadece aktif/onaylı rezervasyonlar uzatılabilir")
     eski_bit = parse_iso(r["bitis_tarihi"])
@@ -3258,13 +3186,12 @@ async def _admin_extend_quote_logic(r: dict, body: ExtendQuoteIn) -> dict:
     if yeni_bit <= eski_bit:
         raise HTTPException(400, "Yeni bitiş tarihi mevcut bitiş tarihinden sonra olmalı")
 
-    # Validate calendar/business hours for new end date
+    # Tatil/mesai kontrolü
     h = await is_holiday(yeni_bit)
     if h:
-        raise HTTPException(400, f"Yeni iade tarihi: {h}")
+        return {"ok": False, "blocked_reason": "tatil", "message": f"Yeni iade tarihi: {h}"}
     bh = await is_within_business_hours(yeni_bit)
     if bh:
-        # 🆕 Orijinal rez mesai dışı oluşturulmuşsa (admin manuel) ve uzatma aynı saatte ise bypass
         try:
             eski_bas = parse_iso(r["baslangic_tarihi"])
             bas_bh = await is_within_business_hours(eski_bas)
@@ -3272,22 +3199,201 @@ async def _admin_extend_quote_logic(r: dict, body: ExtendQuoteIn) -> dict:
             tr_yeni = yeni_bit + timedelta(hours=3)
             ayni_saat = (tr_bas.hour == tr_yeni.hour and abs(tr_bas.minute - tr_yeni.minute) <= 10)
             if not (bas_bh and ayni_saat):
-                raise HTTPException(400, f"Yeni iade saati: {bh}")
-        except HTTPException:
-            raise
+                return {"ok": False, "blocked_reason": "mesai", "message": f"Yeni iade saati: {bh}"}
         except Exception:
-            raise HTTPException(400, f"Yeni iade saati: {bh}")
+            return {"ok": False, "blocked_reason": "mesai", "message": f"Yeni iade saati: {bh}"}
 
-    # Check vehicle availability
+    # Çakışma kontrolü (1 saat tampon)
+    yeni_bit_ext = (yeni_bit + timedelta(hours=1)).isoformat()
+    eski_bas_ext = (parse_iso(r["baslangic_tarihi"]) - timedelta(hours=1)).isoformat()
     conflict = await db.reservations.find_one({
         "vehicle_id": r["vehicle_id"],
-        "id": {"$ne": rid},
+        "id": {"$ne": r["id"]},
         "durum": {"$in": ["beklemede", "onaylandi", "aktif"]},
-        "baslangic_tarihi": {"$lt": body.yeni_bitis_tarihi},
-        "bitis_tarihi": {"$gt": r["baslangic_tarihi"]},
+        "baslangic_tarihi": {"$lt": yeni_bit_ext},
+        "bitis_tarihi": {"$gt": eski_bas_ext},
     })
     if conflict:
-        raise HTTPException(400, "Aracın yeni tarihte başka rezervasyonu var, uzatma yapılamaz")
+        return {"ok": False, "blocked_reason": "cakisma", "message": "Bu araç seçtiğiniz uzatma tarihinde başka bir rezervasyon ile çakışıyor."}
+
+    ek_gun = calc_days(eski_bit, yeni_bit)
+    v = await db.vehicles.find_one({"id": r["vehicle_id"]}, {"_id": 0})
+    if not v:
+        raise HTTPException(404, "Araç bulunamadı")
+    s = await get_settings()
+    fallback_min = s.get("indirim_min_gun", 2)
+    fallback_yuzde = s.get("indirim_yuzde", 10.0)
+
+    eski_gun = int(r.get("gun_sayisi") or 0)
+    yeni_toplam_gun = eski_gun + ek_gun
+    yeni_gunluk_fiyat = daily_price_for(v, yeni_toplam_gun)
+    yeni_base_total = yeni_gunluk_fiyat * yeni_toplam_gun
+    eski_indirim_uygulanmis = float((r.get("pricing") or {}).get("sure_indirim_tutar") or r.get("sure_indirim_tutar") or 0)
+    yeni_total_indirim = sure_indirim_for(v, yeni_toplam_gun, yeni_base_total, fallback_min, fallback_yuzde)
+    ek_indirim = round(max(0.0, yeni_total_indirim - eski_indirim_uygulanmis), 2)
+    ek_base = round(yeni_gunluk_fiyat * ek_gun, 2)
+    ek_arac = round(max(0.0, ek_base - ek_indirim), 2)
+
+    # Ek hizmetler — uzatma için seçilen ekstralar (zorunlu hizmetler hariç tutulur)
+    services_total = 0.0
+    services_breakdown = []
+    if body.secilen_hizmetler:
+        for sel in body.secilen_hizmetler:
+            svc = await db.services.find_one({"id": sel.service_id, "aktif": True}, {"_id": 0})
+            if not svc or svc.get("zorunlu"):
+                continue
+            adet = max(1, sel.adet)
+            line = svc["fiyat"] * adet * (ek_gun if svc["tip"] == "gunluk" else 1)
+            services_total += line
+            services_breakdown.append({
+                "service_id": svc["id"], "isim": svc["isim"], "fiyat": svc["fiyat"], "tutar": round(line, 2),
+            })
+    services_total = round(services_total, 2)
+
+    # Ek KM satın alma
+    ek_km_buy = max(0, int(body.ek_km or 0))
+    km_asim_fiyat = km_asim_for(v, s, days=yeni_toplam_gun)
+    ek_km_brut = round(ek_km_buy * km_asim_fiyat, 2)
+    ek_km_indirim = km_volume_indirim_for(v, s, ek_km_buy)
+    ek_km_tutar = round(max(0.0, ek_km_brut - ek_km_indirim), 2)
+
+    ek_tutar = round(ek_arac + services_total + ek_km_tutar, 2)
+
+    # Bakiye kontrolü (sadece müşteri tarafında)
+    bakiye = 0.0
+    bakiye_yeterli = True
+    eksik = 0.0
+    if check_balance:
+        w = await get_wallet(r["customer_id"])
+        bakiye = w["bakiye"]
+        bakiye_yeterli = bakiye >= ek_tutar
+        eksik = max(0, ek_tutar - bakiye)
+
+    return {
+        "ok": True,
+        "ek_gun": ek_gun,
+        "ek_tutar": ek_tutar,
+        # Admin UI eski isimler — backward compat:
+        "yeni_toplam_gun": yeni_toplam_gun,
+        "yeni_birim_fiyat": yeni_gunluk_fiyat,
+        "arac_fark": ek_arac,
+        "toplam_ek_ucret": ek_tutar,
+        # Müşteri detay alanları:
+        "ek_arac_tutar": ek_arac,
+        "ek_hizmet_tutar": services_total,
+        "ek_hizmetler": services_breakdown,
+        "ek_indirim": ek_indirim,
+        "yeni_toplam_indirim": yeni_total_indirim,
+        "yeni_gunluk_fiyat": yeni_gunluk_fiyat,
+        "eski_gunluk_fiyat": float((r.get("pricing") or {}).get("gunluk_fiyat") or r.get("gunluk_fiyat") or 0),
+        "fiyat_kademe": matched_price_kademe(v, yeni_toplam_gun),
+        "fiyat_kademeleri": v.get("gunluk_fiyat_kademeleri") or [],
+        "km_asim_kademe": matched_km_asim_kademe(v, yeni_toplam_gun),
+        "km_asim_kademeleri": v.get("km_asim_kademeleri") or [],
+        "ek_km_satin": ek_km_buy,
+        "ek_km_brut": ek_km_brut,
+        "ek_km_indirim": ek_km_indirim,
+        "ek_km_tutar": ek_km_tutar,
+        "km_asim_fiyat": km_asim_fiyat,
+        "yeni_gunluk_km": daily_km_for(v, yeni_toplam_gun),
+        "yeni_paket_km": int(r.get("paket_km", 0) or 0) - paket_km_for(v, eski_gun) + paket_km_for(v, yeni_toplam_gun) + ek_km_buy,
+        "bakiye": bakiye,
+        "bakiye_yeterli": bakiye_yeterli,
+        "eksik": eksik,
+    }
+
+# ==================== ORTAK: Süre Uzatma Uygulama ====================
+async def _extend_logic(r: dict, body: ReservationExtend, charge_balance: bool = True, user_id: str = None) -> dict:
+    """Müşteri ve admin tarafı için ortak uzatma uygulama fonksiyonu.
+    - charge_balance=True → müşteri bakiyesinden ÇEKER (sadece müşteri)
+    - charge_balance=False → bakiyeden çekmez, sadece kalan_odeme'ye ekler (admin)
+    """
+    q = await _compute_extend_quote(r, body, check_balance=charge_balance)
+    if not q.get("ok"):
+        # Tatil/mesai/çakışma engelleri
+        raise HTTPException(400, q.get("message") or "Uzatma yapılamadı")
+
+    # Bakiye yeterli mi (sadece müşteri)
+    if charge_balance and not q.get("bakiye_yeterli", True):
+        raise HTTPException(402, f"Bakiye yetersiz. Eksik: {q.get('eksik'):.2f}₺")
+
+    rid = r["id"]
+    ek_tutar = float(q["ek_tutar"])
+    yeni_bit = parse_iso(body.yeni_bitis_tarihi)
+    yeni_toplam_gun = int(q["yeni_toplam_gun"])
+    yeni_paket_km = int(q["yeni_paket_km"])
+    yeni_gunluk_fiyat = float(q["yeni_gunluk_fiyat"])
+
+    # Mevcut pricing'i güncelle
+    eski_pricing = dict(r.get("pricing") or {})
+    eski_arac_toplam = float(eski_pricing.get("arac_toplam") or r.get("arac_tutari") or 0)
+    yeni_arac_toplam = round(eski_arac_toplam + float(q["ek_arac_tutar"]), 2)
+
+    yeni_pricing = {
+        **eski_pricing,
+        "gun_sayisi": yeni_toplam_gun,
+        "gunluk_fiyat": yeni_gunluk_fiyat,
+        "arac_toplam": yeni_arac_toplam,
+        "sure_indirim_tutar": float(q["yeni_toplam_indirim"]),
+        "toplam_tutar": float(r.get("toplam_tutar") or 0) + ek_tutar,
+        "paket_km": yeni_paket_km,
+    }
+
+    update_doc = {
+        "bitis_tarihi": yeni_bit.isoformat(),
+        "gun_sayisi": yeni_toplam_gun,
+        "gunluk_fiyat": yeni_gunluk_fiyat,
+        "arac_tutari": yeni_arac_toplam,
+        "toplam_tutar": round(float(r.get("toplam_tutar") or 0) + ek_tutar, 2),
+        "kalan_odeme": round(float(r.get("kalan_odeme") or 0) + ek_tutar, 2),
+        "paket_km": yeni_paket_km,
+        "pricing": yeni_pricing,
+        "uzatma_sayisi": int(r.get("uzatma_sayisi") or 0) + 1,
+        "son_uzatma_tarih": now_iso(),
+    }
+
+    # Bakiyeden çek (sadece müşteri)
+    if charge_balance and ek_tutar > 0:
+        try:
+            await wallet_add_transaction(
+                r["customer_id"], ek_tutar, "uzatma",
+                f"Rezervasyon süre uzatması ({yeni_toplam_gun} gün)",
+                referans=f"EXTEND-{rid}",
+            )
+            update_doc["kalan_odeme"] = round(float(r.get("kalan_odeme") or 0), 2)  # bakiyeden çekildi, eklenmedi
+            update_doc["odenen_ucret"] = round(float(r.get("odenen_ucret") or 0) + ek_tutar, 2)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"Bakiye işlemi başarısız: {e}")
+
+    await db.reservations.update_one({"id": rid}, {"$set": update_doc})
+
+    # Bildirim
+    try:
+        await notify_customer(
+            r["customer_id"],
+            "Süre Uzatıldı",
+            f"Rezervasyonunuzun süresi {yeni_toplam_gun} güne uzatıldı. Yeni bitiş: {yeni_bit.strftime('%d.%m.%Y %H:%M')}. {'Bakiyenizden çekildi' if charge_balance else 'Kalan ödemeye eklendi'}: {ek_tutar:.2f}₺",
+            {"type": "reservation_extended", "reservation_id": rid},
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, **q, "yeni_bitis_tarihi": yeni_bit.isoformat()}
+
+@api.post("/admin/reservations/{rid}/extend")
+async def admin_extend_reservation(rid: str, body: ReservationExtend, _: dict = Depends(require_admin)):
+    """Admin manuel süre uzatma — Müşteri tarafıyla AYNI mantık.
+    Bakiyeden ÇEKMEZ, kalan ödemeye ekler."""
+    r = await db.reservations.find_one({"id": rid}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Rezervasyon bulunamadı")
+    return await _extend_logic(r, body, charge_balance=False)
+
+async def _admin_extend_quote_logic(r: dict, body: ExtendQuoteIn) -> dict:
+    """Legacy alias — yeni kod _compute_extend_quote kullanır."""
+    return await _compute_extend_quote(r, body, check_balance=False)
 
     ek_gun = calc_days(eski_bit, yeni_bit)
     v = await db.vehicles.find_one({"id": r["vehicle_id"]}, {"_id": 0})
