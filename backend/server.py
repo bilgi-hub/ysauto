@@ -1687,7 +1687,7 @@ async def rental_expiry_reminder_loop():
                 except Exception:
                     bit_local = r["bitis_tarihi"]
                 baslik = "Kiralama Süresi Yaklaşıyor"
-                mesaj = f"{marka} {model} ({plaka}) iadenize ~6 saat kaldı. Bitiş: {bit_local}. Süre uzatmak için 'Kiralarım' bölümünden işlem yapabilirsiniz."
+                mesaj = f"{marka} {model} ({plaka}) iade saatinize yaklaşık 6 saat kaldı. Bitiş: {bit_local}. Süre uzatmak için 'Rezerv.' sayfasından işlem yapabilirsiniz."
                 await notify_customer(r["customer_id"], baslik, mesaj, {"type": "rental_expiry", "reservation_id": r["id"]})
                 await db.reservations.update_one({"id": r["id"]}, {"$set": {"expiry_reminder_sent": True}})
                 logger.info(f"6h reminder sent for reservation {r['id']}")
@@ -1910,7 +1910,7 @@ async def bot_sync_loop():
                         await notify_customer(
                             customer["id"],
                             "KM Hakkınız Bitmek Üzere",
-                            f"{db_vehicle.get('marka','')} {db_vehicle.get('model','')} ({plaka}) için kalan {kalan} km. Tükenince motorunuz kitlenecek — Ek KM almak için uygulamadan 'Süre/KM Uzat'.",
+                            f"{db_vehicle.get('marka','')} {db_vehicle.get('model','')} ({plaka}) için {kalan} km hakkınız kaldı. Tükenince araç motoru kilitlenecektir. Ek KM satın almak için 'Rezerv.' sayfasından işlem yapabilirsiniz.",
                             {"type": "km_warning_50", "reservation_id": reservation["id"], "kalan_km": kalan},
                         )
 
@@ -1922,7 +1922,7 @@ async def bot_sync_loop():
                         await notify_customer(
                             customer["id"],
                             "Motor Kilitlendi",
-                            f"{db_vehicle.get('marka','')} {db_vehicle.get('model','')} ({plaka}) — KM hakkınız bitti, motor kilitlendi. Devam etmek için ek KM satın alın, motor otomatik açılacaktır.",
+                            f"{db_vehicle.get('marka','')} {db_vehicle.get('model','')} ({plaka}) için KM hakkınız tamamen tükendi ve araç motoru kilitlendi. Devam edebilmek için 'Rezerv.' sayfasından ek KM satın aldığınızda motor otomatik açılacaktır.",
                             {"type": "motor_locked", "reservation_id": reservation["id"]},
                         )
                         logger.info(f"bot-sync: motor kilitlendi {plaka} bot_response={ok}")
@@ -1939,7 +1939,7 @@ async def bot_sync_loop():
                         await notify_customer(
                             customer["id"],
                             "Motor Açıldı",
-                            f"{db_vehicle.get('marka','')} {db_vehicle.get('model','')} ({plaka}) — Yeni KM hakkınız aktif, motorunuz açıldı. İyi yolculuklar!",
+                            f"{db_vehicle.get('marka','')} {db_vehicle.get('model','')} ({plaka}) için yeni KM hakkınız tanımlandı ve araç motoru açıldı. İyi yolculuklar dileriz! 🚗",
                             {"type": "motor_unlocked", "reservation_id": reservation["id"]},
                         )
                         logger.info(f"bot-sync: motor açıldı {plaka} bot_response={ok}")
@@ -3029,6 +3029,99 @@ async def extend_reservation(rid: str, body: ReservationExtend, user: dict = Dep
     r = await db.reservations.find_one({"id": rid, "customer_id": user["id"]}, {"_id": 0})
     if not r:
         raise HTTPException(404, "Rezervasyon bulunamadı")
+    return await _extend_logic(r, body, charge_balance=True)
+
+@api.post("/admin/reservations/{rid}/extend-quote")
+async def admin_extend_quote(rid: str, body: ExtendQuoteIn, _: dict = Depends(require_admin)):
+    """Admin için süre uzatma teklif (fiyat hesabı). Müşteriye eklenecek tutarı döner."""
+    r = await db.reservations.find_one({"id": rid}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Rezervasyon bulunamadı")
+    return await _admin_extend_quote_logic(r, body)
+
+@api.post("/admin/reservations/{rid}/extend")
+async def admin_extend_reservation(rid: str, body: ReservationExtend, _: dict = Depends(require_admin)):
+    """Admin manuel süre uzatma — kademe/indirim sistemi uygulanır.
+    Müşteri bakiyesinden ÇEKMEZ, sadece rezervasyon kalan ödemesine eklenir."""
+    r = await db.reservations.find_one({"id": rid}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Rezervasyon bulunamadı")
+    if r["durum"] not in ("onaylandi", "aktif"):
+        raise HTTPException(400, "Sadece aktif/onaylı rezervasyonlar uzatılabilir")
+    eski_bit = parse_iso(r["bitis_tarihi"])
+    yeni_bit = parse_iso(body.yeni_bitis_tarihi)
+    if yeni_bit <= eski_bit:
+        raise HTTPException(400, "Yeni bitiş tarihi mevcut bitiş tarihinden sonra olmalı")
+    # araç çakışması kontrolü
+    conflict = await db.reservations.find_one({
+        "vehicle_id": r["vehicle_id"],
+        "id": {"$ne": rid},
+        "durum": {"$in": ["beklemede", "onaylandi", "aktif"]},
+        "$expr": {"$and": [
+            {"$lt": ["$baslangic_tarihi", yeni_bit.isoformat()]},
+            {"$gt": ["$bitis_tarihi", eski_bit.isoformat()]},
+        ]},
+    }, {"_id": 0, "id": 1})
+    if conflict:
+        raise HTTPException(409, "Bu tarihte araç başka bir rezervasyonla çakışıyor")
+    # quote hesapla
+    quote = await _admin_extend_quote_logic(r, ExtendQuoteIn(yeni_bitis_tarihi=body.yeni_bitis_tarihi, secilen_hizmetler=[], ek_km=0))
+    yeni_arac_tutari = round(float(r.get("arac_tutari", 0) or 0) + float(quote["arac_fark"] or 0), 2)
+    yeni_toplam = round(float(r.get("toplam_tutar", 0) or 0) + float(quote["toplam_ek_ucret"] or 0), 2)
+    yeni_kalan = round(float(r.get("kalan_odeme", 0) or 0) + float(quote["toplam_ek_ucret"] or 0), 2)
+    yeni_gun = int(quote["yeni_toplam_gun"])
+    # paket KM'yi de yeni gün sayısına göre yeniden hesaplayalım
+    v = await db.vehicles.find_one({"id": r["vehicle_id"]}, {"_id": 0}) if r.get("vehicle_id") else None
+    yeni_paket_km = paket_km_for(v, yeni_gun) if v else int(r.get("paket_km", 0) or 0)
+    await db.reservations.update_one({"id": rid}, {"$set": {
+        "bitis_tarihi": yeni_bit.isoformat(),
+        "gun": yeni_gun,
+        "arac_tutari": yeni_arac_tutari,
+        "toplam_tutar": yeni_toplam,
+        "kalan_odeme": yeni_kalan,
+        "paket_km": yeni_paket_km,
+        "uzatma_tarihi": now_iso(),
+    }})
+    # bildirim
+    try:
+        await notify_customer(
+            r["customer_id"],
+            "Süre Uzatıldı",
+            f"Rezervasyonunuzun süresi {yeni_gun} güne uzatıldı. Yeni bitiş: {yeni_bit.strftime('%d.%m.%Y %H:%M')}. Eklenen tutar: {quote['toplam_ek_ucret']:.2f}₺",
+            {"type": "reservation_extended", "reservation_id": rid},
+        )
+    except Exception:
+        pass
+    return {"ok": True, **quote, "yeni_bitis_tarihi": yeni_bit.isoformat()}
+
+async def _admin_extend_quote_logic(r: dict, body: ExtendQuoteIn) -> dict:
+    """Ortak quote hesabı — kademe fiyat ile."""
+    eski_bit = parse_iso(r["bitis_tarihi"])
+    yeni_bit = parse_iso(body.yeni_bitis_tarihi)
+    if yeni_bit <= eski_bit:
+        raise HTTPException(400, "Yeni bitiş tarihi mevcut bitiş tarihinden sonra olmalı")
+    eski_bas = parse_iso(r["baslangic_tarihi"])
+    eski_gun = max(1, int((eski_bit - eski_bas).total_seconds() // 86400) or 1)
+    total_sec = (yeni_bit - eski_bas).total_seconds()
+    yeni_toplam_gun = max(eski_gun + 1, int(total_sec // 86400) + (1 if total_sec % 86400 > 0 else 0))
+    ek_gun = yeni_toplam_gun - eski_gun
+    v = await db.vehicles.find_one({"id": r.get("vehicle_id")}, {"_id": 0}) if r.get("vehicle_id") else None
+    # kademe fiyat (varsa)
+    try:
+        yeni_birim = await get_tiered_daily_price(v, yeni_toplam_gun) if v else float((r.get("vehicle_snapshot") or {}).get("gunluk_fiyat", 0) or 0)
+    except Exception:
+        yeni_birim = float(v.get("gunluk_fiyat", 0) or 0) if v else float((r.get("vehicle_snapshot") or {}).get("gunluk_fiyat", 0) or 0)
+    eski_arac = float(r.get("arac_tutari", 0) or 0)
+    yeni_arac = round(yeni_birim * yeni_toplam_gun, 2)
+    arac_fark = round(yeni_arac - eski_arac, 2)
+    toplam_ek = round(arac_fark, 2)
+    return {
+        "ek_gun": ek_gun,
+        "yeni_toplam_gun": yeni_toplam_gun,
+        "yeni_birim_fiyat": yeni_birim,
+        "arac_fark": arac_fark,
+        "toplam_ek_ucret": toplam_ek,
+    }
     if r["durum"] not in ("onaylandi", "aktif"):
         raise HTTPException(400, "Sadece aktif/onaylı rezervasyonlar uzatılabilir")
     eski_bit = parse_iso(r["bitis_tarihi"])
@@ -4413,7 +4506,7 @@ async def admin_motor_blokaj(vid: str, body: MotorBlokajIn, _: dict = Depends(re
                 await notify_customer(
                     active["customer_id"],
                     "Motor Açıldı",
-                    f"{v.get('marka','')} {v.get('model','')} ({plaka}) — Aracınızın motoru açıldı. İyi yolculuklar!",
+                    f"{v.get('marka','')} {v.get('model','')} ({plaka}) aracınızın motoru açılmıştır. İyi yolculuklar dileriz! 🚗",
                     {"type": "motor_unlocked_manual", "reservation_id": active["id"]},
                 )
         except Exception as e:
@@ -4499,8 +4592,8 @@ async def admin_set_reservation_status(rid: str, durum: str, _: dict = Depends(r
             plaka = (r.get("vehicle_snapshot") or {}).get("plaka", "")
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()),
-                "baslik": "⭐ Yorum Bırakır mısınız?",
-                "mesaj": f"{plaka} araç kiralamanız tamamlandı. Deneyiminizi puanlayarak diğer müşterilere yardımcı olur musunuz?",
+                "baslik": "⭐ Deneyiminizi Paylaşır mısınız?",
+                "mesaj": f"{plaka} plakalı araç kiralamanız sona ermiştir. Deneyiminizi puanlayarak diğer müşterilere yardımcı olabilir misiniz? 'Bildirim' sayfasından yorum bırakabilirsiniz.",
                 "hedef_type": "secili",
                 "hedef_customer_ids": [r["customer_id"]],
                 "tarih": now_iso(),
@@ -4990,8 +5083,8 @@ async def admin_set_km(rid: str, alis_km: Optional[int] = None, guncel_km: Optio
                 except HTTPException as e:
                     await db.notifications.insert_one({
                         "id": str(uuid.uuid4()),
-                        "baslik": "KM Aşım — Bakiye Yetersiz",
-                        "mesaj": f"Aracınızda {asim} km aşım var. Lütfen bakiye yükleyin.",
+                        "baslik": "KM Aşımı — Bakiye Yetersiz",
+                        "mesaj": f"Aracınızda {asim} km aşım tespit edildi ancak bakiyeniz yetersiz olduğu için tahsil edilemedi. Lütfen 'Bakiye' sayfasından bakiye yükleyiniz.",
                         "hedef_type": "secili",
                         "hedef_customer_ids": [r["customer_id"]],
                         "tarih": now_iso(),
@@ -5207,8 +5300,8 @@ async def admin_refund_provision(pid: str, _: dict = Depends(require_admin)):
     await db.provisions.update_one({"id": pid}, {"$set": {"durum": "iade_edildi", "iade_tarihi": now_iso()}})
     await db.notifications.insert_one({
         "id": str(uuid.uuid4()),
-        "baslik": "Provizyon İade Edildi",
-        "mesaj": f"{p['tutar']:.2f}₺ provizyon bakiyenize iade edildi.",
+        "baslik": "Provizyon İadesi Yapıldı",
+        "mesaj": f"Rezervasyonunuzun provizyon tutarı olan {p['tutar']:.2f}₺ bakiyenize iade edilmiştir.",
         "hedef_type": "secili",
         "hedef_customer_ids": [p["customer_id"]],
         "tarih": now_iso(), "okuyanlar": [],
@@ -5453,7 +5546,7 @@ async def admin_ek_km_iade(rid: str, body: EkKmIadeIn, current: dict = Depends(r
         await db.notifications.insert_one({
             "id": str(uuid.uuid4()),
             "baslik": "Ek KM İadesi Yapıldı",
-            "mesaj": f"Rezervasyonunuzdan {body.iade_km} km iade edildi. Tutar: {iade_tutar:.2f}₺",
+            "mesaj": f"Rezervasyonunuzdan {body.iade_km} km iade edilmiştir. {iade_tutar:.2f}₺ tutar bakiyenize aktarılmıştır.",
             "hedef_type": "secili",
             "hedef_customer_ids": [r.get("customer_id")] if r.get("customer_id") else [],
             "tarih": now_iso(), "okuyanlar": [],
