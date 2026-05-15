@@ -59,7 +59,28 @@ BOT_BEARER = os.environ.get(
     "913dde91c73eee7797c4fb3d8acf0e4a6d8178889cb7931e5b36274663834693",
 )
 
-client = AsyncIOMotorClient(MONGO_URL)
+# ⚡ Atlas + Railway için optimize edilmiş bağlantı havuzu
+# - maxPoolSize=10  : M0 ücretsiz katmanı max 500 bağlantı → Railway'de birden fazla
+#                    worker varsa bağlantı patlamasını önler
+# - serverSelectionTimeoutMS=8000 : 8 sn içinde server bulunamazsa hata ver (sonsuz bekleme değil)
+# - connectTimeoutMS=10000         : bağlantı kurulumu için 10 sn limit
+# - socketTimeoutMS=30000          : açık bağlantıda 30 sn işlem limiti (uzun sorgular için)
+# - heartbeatFrequencyMS=10000     : Atlas sunucu kontrolü 10 sn aralıklı (varsayılan 10sn zaten)
+# - retryWrites=True               : geçici yazma hataları otomatik tekrarlanır
+# - retryReads=True                : geçici okuma hataları otomatik tekrarlanır
+# - waitQueueTimeoutMS=8000        : pool dolu iken istek 8 sn bekler, sonra hata verir
+client = AsyncIOMotorClient(
+    MONGO_URL,
+    maxPoolSize=10,
+    minPoolSize=1,
+    serverSelectionTimeoutMS=8000,
+    connectTimeoutMS=10000,
+    socketTimeoutMS=30000,
+    heartbeatFrequencyMS=10000,
+    retryWrites=True,
+    retryReads=True,
+    waitQueueTimeoutMS=8000,
+)
 db = client[DB_NAME]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -1499,6 +1520,12 @@ async def seed_demo():
 
 @app.on_event("startup")
 async def startup():
+    # ⚡ Atlas bağlantısını ısıt — cold start gecikmesini başlangıçta yut
+    try:
+        await client.admin.command("ping")
+        logger.info("✅ MongoDB Atlas bağlantısı doğrulandı")
+    except Exception as e:
+        logger.warning(f"⚠️  MongoDB Atlas ping başarısız: {e}")
     await ensure_indexes()
     await seed_tenants()
     await migrate_tenant_id()
