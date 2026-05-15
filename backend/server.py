@@ -430,6 +430,9 @@ async def get_settings() -> dict:
 
 # ==================== AI DEKONT DOĞRULAMA ====================
 EMERGENT_LLM_KEY = os.getenv("EMERGENT_LLM_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Confidence >= bu eşik => otomatik onay, altı => admin manuel onay
+DEKONT_AUTO_APPROVE_CONFIDENCE = float(os.getenv("DEKONT_AUTO_APPROVE_CONFIDENCE", "0.85"))
 
 def _norm_iban(s: Optional[str]) -> str:
     if not s:
@@ -462,22 +465,25 @@ async def validate_dekont_with_ai(
       "reasons": [str]              # uyumsuzluklar listesi
     }
     """
-    if not EMERGENT_LLM_KEY:
-        return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": ["AI servisi yapılandırılmamış"]}
+    if not GEMINI_API_KEY:
+        return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": ["AI servisi yapılandırılmamış (GEMINI_API_KEY tanımlı değil)"]}
 
-    # data: prefix'i kaldır
+    # data: prefix'i kaldır + mime type yakala
     raw = foto_base64.strip()
+    mime_type = "image/jpeg"
     if raw.startswith("data:"):
-        comma = raw.find(",")
-        if comma > 0:
-            raw = raw[comma + 1:]
+        # data:image/png;base64,XXXX
+        try:
+            header, raw = raw.split(",", 1)
+            m_mime = re.search(r"data:([^;]+);base64", header)
+            if m_mime:
+                mime_type = m_mime.group(1)
+        except Exception:
+            comma = raw.find(",")
+            if comma > 0:
+                raw = raw[comma + 1:]
 
-    try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
-    except Exception as e:
-        logger.error(f"emergentintegrations import error: {e}")
-        return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": [f"AI kütüphanesi yüklenemedi: {e}"]}
-
+    # Sistem promptu
     sys_msg = (
         "Sen bir banka dekont/transfer makbuzu analiz uzmanısın. Sana verilen Türkçe banka dekontu "
         "veya havale/EFT makbuzu fotoğrafından şu alanları çıkar ve SADECE JSON formatında dön:\n"
@@ -494,38 +500,58 @@ async def validate_dekont_with_ai(
         "Sadece JSON dön, başka açıklama yapma."
     )
 
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"dekont-{uuid.uuid4().hex[:10]}",
-        system_message=sys_msg,
-    ).with_model("gemini", "gemini-2.5-pro")
-
-    image = ImageContent(image_base64=raw)
-    msg = UserMessage(
-        text=(
-            "Bu banka dekontunu analiz et ve istenen JSON'u dön. "
-            f"Beklenen alıcı IBAN: {expected_iban or '(belirtilmemiş)'}\n"
-            f"Beklenen alıcı: {expected_recipient_name or '(belirtilmemiş)'}\n"
-            f"Beklenen gönderici: {expected_sender_name or '(belirtilmemiş)'}\n"
-            f"Beklenen tutar: {expected_amount} TL"
-        ),
-        file_contents=[image],
+    user_text = (
+        "Bu banka dekontunu analiz et ve istenen JSON'u dön. "
+        f"Beklenen alıcı IBAN: {expected_iban or '(belirtilmemiş)'}\n"
+        f"Beklenen alıcı: {expected_recipient_name or '(belirtilmemiş)'}\n"
+        f"Beklenen gönderici: {expected_sender_name or '(belirtilmemiş)'}\n"
+        f"Beklenen tutar: {expected_amount} TL"
     )
 
+    gemini_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": sys_msg}]},
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": user_text},
+                {"inline_data": {"mime_type": mime_type, "data": raw}},
+            ],
+        }],
+        "generationConfig": {
+            "temperature": 0.1,
+            "response_mime_type": "application/json",
+        },
+    }
+
     try:
-        ai_resp = await chat.send_message(msg)
+        async with httpx.AsyncClient(timeout=60.0) as cli:
+            r = await cli.post(gemini_url, json=payload)
+            if r.status_code != 200:
+                err_txt = r.text[:300]
+                logger.error(f"Gemini API hata {r.status_code}: {err_txt}")
+                return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": [f"Gemini API hatası (HTTP {r.status_code})"]}
+            data = r.json()
     except Exception as e:
-        logger.error(f"LLM dekont error: {e}")
-        return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": [f"AI hatası: {e}"]}
+        logger.error(f"Gemini API isteği başarısız: {e}")
+        return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": [f"AI bağlantı hatası: {e}"]}
+
+    # Gemini response'tan metni çek
+    try:
+        ai_resp = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        logger.error(f"Gemini response parse hatası: {_json.dumps(data)[:300]}")
+        return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": ["Gemini cevabı beklenen formatta değil"]}
 
     # JSON extract
     raw_txt = ai_resp.strip() if isinstance(ai_resp, str) else str(ai_resp)
-    # Code block temizle
     raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt.strip(), flags=re.MULTILINE)
     try:
         parsed = _json.loads(raw_txt)
     except Exception:
-        # JSON bulamadık - regex ile substring çek
         m = re.search(r"\{.*\}", raw_txt, re.DOTALL)
         if not m:
             return {"valid": False, "fields": {}, "confidence": 0.0, "reasons": [f"AI çıktısı JSON değil: {raw_txt[:200]}"]}
@@ -621,18 +647,34 @@ async def validate_dekont_with_ai(
             reasons.append(f"Gönderici uyuşmuyor: dekont='{ext_gonderen}', müşteri='{exp_gonderen}'")
     fields_report["gonderici_adi"] = {"extracted": ext_gonderen, "expected": exp_gonderen, "match": gonderen_ok}
 
-    valid = (
+    # Tüm 5 alan eşleşmesi (yardımcı bilgi olarak hesaplanır)
+    all_fields_match = (
         is_valid_receipt and tarih_ok and tutar_ok and iban_ok and alici_ok and gonderen_ok
-        and confidence >= 0.6
     )
-    if confidence < 0.6 and is_valid_receipt:
-        reasons.append(f"AI güveni düşük ({confidence:.2f})")
+    # Otomatik onay kuralı (kullanıcı isteği):
+    #   - confidence > DEKONT_AUTO_APPROVE_CONFIDENCE (default 0.85) VE
+    #   - is_valid_receipt = true VE
+    #   - tutar/IBAN/alıcı eşleşiyor (tarih ve gönderici uyumu confidence içinde kapsanır)
+    # Tüm eşleşme şartını da arıyoruz ki yanlış dekont (örn. başkasının kestiği) otomatik onaylanmasın.
+    valid = bool(
+        all_fields_match
+        and confidence > DEKONT_AUTO_APPROVE_CONFIDENCE
+    )
+    if not valid:
+        if not is_valid_receipt:
+            pass  # already added above
+        elif confidence <= DEKONT_AUTO_APPROVE_CONFIDENCE:
+            reasons.append(
+                f"AI güven skoru otomatik onay eşiğinin altında ({confidence:.2f} ≤ {DEKONT_AUTO_APPROVE_CONFIDENCE:.2f}) — admin onayı bekleniyor"
+            )
 
     return {
         "valid": valid,
         "fields": fields_report,
         "confidence": confidence,
         "is_valid_receipt": is_valid_receipt,
+        "all_fields_match": all_fields_match,
+        "auto_approve_threshold": DEKONT_AUTO_APPROVE_CONFIDENCE,
         "reasons": reasons,
     }
 

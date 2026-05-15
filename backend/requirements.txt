@@ -25,6 +25,5 @@ python-multipart>=0.0.9
 httpx>=0.27.0
 jq>=1.6.0
 typer>=0.9.0
-# NOT: emergentintegrations Emergent'in özel paketidir (AI dekont okuma için).
-# Railway/public PyPI'da yok — Emergent'te local olarak çalışır.
-# Kod try/except ile sarmalanmış, paket olmasa da uygulama çalışır.
+# Gemini 2.5 Flash dekont AI doğrulaması direkt httpx çağrısıyla yapılıyor (REST API).
+# Railway env'de GEMINI_API_KEY tanımlanmalı.
