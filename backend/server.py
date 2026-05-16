@@ -289,6 +289,7 @@ class ManualReservationCreate(BaseModel):
     bitis_tarihi: str
     telefon: str
     iskonto_yuzde: float = 0.0
+    iskonto_tutar: Optional[float] = None  # 🆕 ₺ bazlı direkt indirim — admin form'dan gelir; öncelikli
     secilen_hizmetler: List[ServiceSelection] = []
     odeme_durumu: str = "beklemede"  # beklemede / on_odeme_alindi / tam_odeme_alindi
     # Admin overrides (opsiyonel)
@@ -1051,9 +1052,10 @@ def km_volume_indirim(settings: dict, ek_km: int) -> float:
             best = amt
     return round(max(0.0, best), 2)
 
-async def calc_pricing(vehicle: dict, days: int, services_sel: List[dict] = None, iskonto_yuzde: float = 0.0, force_mandatory: bool = True) -> dict:
+async def calc_pricing(vehicle: dict, days: int, services_sel: List[dict] = None, iskonto_yuzde: float = 0.0, force_mandatory: bool = True, iskonto_tutar: float = 0.0) -> dict:
     """Compute reservation pricing with discount and services.
-    force_mandatory=False ise zorunlu hizmetler otomatik eklenmez (admin kullanıcı tarafından kaldırılabilir)."""
+    force_mandatory=False ise zorunlu hizmetler otomatik eklenmez (admin kullanıcı tarafından kaldırılabilir).
+    iskonto_tutar > 0 ise direkt ₺ olarak indirim uygulanır (% yerine). Yüzdesel uyumluluk için iskonto_yuzde de hesaplanır."""
     s = await get_settings()
     fallback_min = s.get("indirim_min_gun", 2)
     fallback_yuzde = s.get("indirim_yuzde", 10.0)
@@ -1096,7 +1098,13 @@ async def calc_pricing(vehicle: dict, days: int, services_sel: List[dict] = None
             })
 
     subtotal = arac_total + services_total
-    iskonto_admin = round(subtotal * (iskonto_yuzde / 100.0), 2) if iskonto_yuzde else 0.0
+    # 🆕 ₺ bazlı indirim öncelikli — admin form '₺' giriyor; eski uyumluluk için yüzdesel de desteklenir
+    if iskonto_tutar and iskonto_tutar > 0:
+        iskonto_admin = round(min(float(iskonto_tutar), subtotal), 2)
+        # Görüntü için efektif yüzde
+        iskonto_yuzde = round((iskonto_admin / subtotal * 100.0) if subtotal > 0 else 0.0, 2)
+    else:
+        iskonto_admin = round(subtotal * (iskonto_yuzde / 100.0), 2) if iskonto_yuzde else 0.0
     toplam = round(max(0, subtotal - iskonto_admin), 2)
     on_odeme = round(toplam * 0.20, 2)
 
@@ -5018,6 +5026,7 @@ class AdminReservationUpdate(BaseModel):
     # NEW: Admin manuel ek hizmet düzenlemesi — None ise dokunulmaz, [] gönderilirse tüm hizmetler kaldırılır
     secilen_hizmetler: Optional[List[ServiceSelection]] = None
     iskonto_yuzde: Optional[float] = None
+    iskonto_tutar: Optional[float] = None  # 🆕 ₺ bazlı direkt indirim — admin form'dan gelir; öncelikli
     # auto_recalc_total=True: secilen_hizmetler değişince toplam_tutar otomatik hesaplanır
     # (kullanıcı toplam_tutar'ı da gönderirse o öncelikli olur)
     auto_recalc_total: Optional[bool] = True
@@ -5071,8 +5080,9 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
                 # gün sayısı: yeni varsa onu, yoksa mevcut
                 days = upd.get("gun_sayisi") or cur_r.get("gun_sayisi") or 1
                 iskonto = float(upd.get("iskonto_yuzde", cur_r.get("iskonto_yuzde", 0)) or 0)
+                iskonto_t = float(upd.get("iskonto_tutar", cur_r.get("iskonto_tutar", 0)) or 0)
                 # Zorunlu hizmetleri otomatik EKLEME — admin elle kaldırabilmeli
-                pricing = await calc_pricing(vehicle, int(days), upd.get("secilen_hizmetler", []), iskonto, force_mandatory=False)
+                pricing = await calc_pricing(vehicle, int(days), upd.get("secilen_hizmetler", []), iskonto, force_mandatory=False, iskonto_tutar=iskonto_t)
                 # Kullanıcı toplam_tutar'ı explicit göndermediyse, hesaplanan toplamı kullan
                 if "toplam_tutar" not in upd:
                     upd["toplam_tutar"] = pricing["toplam_tutar"]
@@ -5093,6 +5103,7 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
             if vehicle:
                 days = upd.get("gun_sayisi") or cur_r.get("gun_sayisi") or 1
                 iskonto = float(upd.get("iskonto_yuzde", cur_r.get("iskonto_yuzde", 0)) or 0)
+                iskonto_t = float(upd.get("iskonto_tutar", cur_r.get("iskonto_tutar", 0)) or 0)
                 # Mevcut hizmetler: payload'da gelmediyse rezervasyondaki hizmetlerden seçimleri çıkar
                 sel = upd.get("secilen_hizmetler")
                 if sel is None:
@@ -5100,7 +5111,7 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
                     for h in (cur_r.get("hizmetler") or []):
                         if h.get("service_id"):
                             sel.append({"service_id": h["service_id"], "adet": h.get("adet", 1)})
-                pricing = await calc_pricing(vehicle, int(days), sel, iskonto, force_mandatory=False)
+                pricing = await calc_pricing(vehicle, int(days), sel, iskonto, force_mandatory=False, iskonto_tutar=iskonto_t)
                 if recalc_toplam:
                     upd["toplam_tutar"] = pricing["toplam_tutar"]
                 # 🔄 pricing alt-objesini de güncelle ki konsinye/raporlar doğru çalışsın
@@ -5135,13 +5146,14 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
             if vehicle:
                 days = upd.get("gun_sayisi") or cur_r.get("gun_sayisi") or 1
                 iskonto = float(upd.get("iskonto_yuzde", cur_r.get("iskonto_yuzde", 0)) or 0)
+                iskonto_t = float(upd.get("iskonto_tutar", cur_r.get("iskonto_tutar", 0)) or 0)
                 sel = upd.get("secilen_hizmetler")
                 if sel is None:
                     sel = []
                     for h in (cur_r.get("hizmetler") or []):
                         if h.get("service_id"):
                             sel.append({"service_id": h["service_id"], "adet": h.get("adet", 1)})
-                pricing = await calc_pricing(vehicle, int(days), sel, iskonto, force_mandatory=False)
+                pricing = await calc_pricing(vehicle, int(days), sel, iskonto, force_mandatory=False, iskonto_tutar=iskonto_t)
                 upd["pricing"] = pricing
         except Exception as e:
             logger.warning(f"admin_edit pricing sync başarısız rid={rid}: {e}")
@@ -5546,7 +5558,7 @@ async def admin_create_manual_reservation(body: ManualReservationCreate, _: dict
     days = calc_days(bas, bit)
 
     services = [s.dict() for s in body.secilen_hizmetler]
-    pricing = await calc_pricing(v, days, services, iskonto_yuzde=body.iskonto_yuzde)
+    pricing = await calc_pricing(v, days, services, iskonto_yuzde=body.iskonto_yuzde, iskonto_tutar=float(body.iskonto_tutar or 0))
 
     # Override'lar: admin manuel girdi
     final_toplam = pricing["toplam_tutar"]
@@ -5596,6 +5608,7 @@ async def admin_create_manual_reservation(body: ManualReservationCreate, _: dict
         "son_uzatma_tarih": None,
         "olusturan": "admin",
         "iskonto_yuzde": body.iskonto_yuzde,
+        "iskonto_tutar": float(body.iskonto_tutar or 0),
         "created_at": now_iso(),
     }
 
@@ -7190,11 +7203,13 @@ async def admin_vehicle_performance(
             pricing_synced = False
 
         if pricing_synced:
-            arac_gelir_full = float(pricing.get("arac_toplam") or pricing.get("arac_total") or 0)
-            hizmet_gelir_full = float(pricing.get("hizmetler_toplam") or 0) + float(r.get("ek_hizmet_tutar") or 0)
-            # Eğer pricing.hizmetler_toplam=0 ama secilen_hizmetler'den hesap > 0 ise üstüne yaz
-            if hizmet_gelir_full <= 0 and hizmetler_toplam_dogru > 0:
-                hizmet_gelir_full = hizmetler_toplam_dogru
+            # 🎯 MANUEL ÖNCELİKLİ: toplam_tutar - hizmetler - km — admin'in manuel düzenlemeleri (Bayram, müzakere) yansır
+            # Konsinye hesabıyla %100 uyumlu (kasa = kazanç = konsinye)
+            arac_gelir_full = max(0.0, round(toplam_full - hizmetler_toplam_dogru - km_gelir_full, 2))
+            # Fallback: toplam_tutar 0 ise pricing.arac_toplam kullan
+            if arac_gelir_full <= 0:
+                arac_gelir_full = float(pricing.get("arac_toplam") or pricing.get("arac_total") or 0)
+            hizmet_gelir_full = hizmetler_toplam_dogru + float(r.get("ek_hizmet_tutar") or 0)
         else:
             # ⚠️ pricing eski/uyumsuz — toplam_tutar'dan türev hesap (cashflow ile tutarlı)
             arac_gelir_full = max(0.0, round(toplam_full - hizmetler_toplam_dogru - km_gelir_full, 2))
@@ -7280,7 +7295,9 @@ async def admin_vehicle_performance(
             pay_yuzde = float(v.get("konsinye_pay_yuzde") or 70.0) if is_konsinye else 0.0
             # Konsinye hesaplama: arac_gelir + km_gelir konsinye payına dahildir; hizmet_gelir DAHİL DEĞİL
             konsinye_brut = round(a["arac_gelir"] + a["km_gelir"], 2) if is_konsinye else 0.0
-            konsinye_devlet = round(100.0 * a["kiralama_gun"], 2) if is_konsinye else 0.0
+            # 🔧 Devlet kesintisi UI'da gösterilen tam gün sayısı ile birebir uyumlu olsun (kesir yok)
+            gun_int = int(round(a["kiralama_gun"]))
+            konsinye_devlet = round(100.0 * gun_int, 2) if is_konsinye else 0.0
             konsinye_net = max(0.0, round(konsinye_brut - konsinye_devlet, 2))
             konsinye_hakkedis = round(konsinye_net * pay_yuzde / 100.0, 2) if is_konsinye else 0.0
             ys_komisyonu_konsinye = round(konsinye_net - konsinye_hakkedis, 2) if is_konsinye else 0.0
@@ -7931,12 +7948,14 @@ async def calculate_konsinye_earning_for_reservation(rez: dict, vehicle: Optiona
     🚀 PERFORMANS: vehicle parametresi geçilirse DB sorgusu yapılmaz.
 
     Formül:
-      Brüt = arac_toplam (orijinal) + uzatma_arac_tutar (varsa) + ek_km_satin_alim_tutar
+      arac_toplam = toplam_tutar - hizmetler  (Ek KM ve uzatma zaten içinde)
+      Brüt = arac_toplam + uzatma_arac (fallback paths için)
       Devlet Kesintisi = 100₺ × toplam_gun
       Net = max(0, Brüt - Devlet Kesintisi)
       Sahibin Hak Edişi = Net × pay_yuzde / 100
 
     Ek hizmetler (yıkama, çocuk koltuğu, doluluk vb.) DAHIL DEĞİLDİR — YS Auto'da kalır.
+    Ek KM satın alımları arac_toplam içinde tek seferde sayılır (çift sayım yok).
     """
     vid = rez.get("vehicle_id")
     if not vid:
@@ -7964,11 +7983,23 @@ async def calculate_konsinye_earning_for_reservation(rez: dict, vehicle: Optiona
     pricing_gun = int(pricing.get("gun_sayisi") or 0)
     pricing_synced = bool(pricing_gun) and pricing_gun == gun
 
-    # ✨ HİZMET KAYNAĞI ÖNCELİĞİ: secilen_hizmetler (rezervasyon root) > pricing.hizmetler > ekstra_hizmetler
+    # ✨ HİZMET KAYNAĞI ÖNCELİĞİ: fiyat/tutar bilgisi olan listeyi tercih et
+    # secilen_hizmetler bazen kompakt formda gelir: {service_id, adet} — fiyat YOK
+    # Bu durumda pricing.hizmetler kullanılmalı (full bilgi var)
     hiz_root = rez.get("secilen_hizmetler") or []
     hiz_pricing = pricing.get("hizmetler") or []
     hiz_extra = rez.get("ekstra_hizmetler") or []
-    hizmet_listesi = hiz_root if len(hiz_root) > 0 else (hiz_pricing if len(hiz_pricing) > 0 else hiz_extra)
+    def _has_price_info(h: dict) -> bool:
+        return bool(h.get("fiyat") or h.get("tutar") or h.get("birim_fiyat"))
+    hiz_root_has_price = len(hiz_root) > 0 and all(_has_price_info(h) for h in hiz_root)
+    if hiz_root_has_price:
+        hizmet_listesi = hiz_root
+    elif len(hiz_pricing) > 0:
+        hizmet_listesi = hiz_pricing
+    elif len(hiz_root) > 0:
+        hizmet_listesi = hiz_root  # son çare (0 hesaplanabilir)
+    else:
+        hizmet_listesi = hiz_extra
     hizmetler_toplam_dogru = 0.0
     for h in hizmet_listesi:
         tip = str(h.get("tip") or "tek_seferlik").lower()
@@ -7993,19 +8024,27 @@ async def calculate_konsinye_earning_for_reservation(rez: dict, vehicle: Optiona
         pricing_synced = False
 
     if pricing_synced:
-        arac_toplam = float(
-            pricing.get("arac_toplam")
-            or pricing.get("arac_total")
-            or rez.get("arac_toplam")
-            or 0
-        )
-    else:
-        # ⚠️ Pricing eski/uyumsuz — toplam_tutar - hizmetler - ek_km'den türet
+        # 🆕 KAZANÇLAR sayfasıyla TUTARLI MANTIK:
+        # Konsinye payı = araç + ek KM (ek KM de konsinyeye dahil)
+        # Sadece ek hizmetler (yıkama, koltuk, vs.) YS Auto'ya kalır
+        # Bayram/admin manuel girişler için: toplam_tutar - hizmetler kullan
         toplam_tutar_rez = float(rez.get("toplam_tutar") or 0)
-        arac_toplam = max(0.0, round(toplam_tutar_rez - hizmetler_toplam_dogru - ek_km_satin_alim_tutar, 2))
+        if toplam_tutar_rez > 0:
+            arac_toplam = max(0.0, round(toplam_tutar_rez - hizmetler_toplam_dogru, 2))
+        else:
+            arac_toplam = float(
+                pricing.get("arac_toplam")
+                or pricing.get("arac_total")
+                or rez.get("arac_toplam")
+                or 0
+            ) + ek_km_satin_alim_tutar
+    else:
+        # ⚠️ Pricing eski/uyumsuz — toplam_tutar - hizmetler'den türet (ek_km DAHİL)
+        toplam_tutar_rez = float(rez.get("toplam_tutar") or 0)
+        arac_toplam = max(0.0, round(toplam_tutar_rez - hizmetler_toplam_dogru, 2))
         if arac_toplam <= 0:
             gf = float(pricing.get("gunluk_fiyat") or pricing.get("gunluk_fiyat_baz") or rez.get("gunluk_birim_fiyat") or 0)
-            arac_toplam = round(gf * max(1, gun), 2)
+            arac_toplam = round(gf * max(1, gun), 2) + ek_km_satin_alim_tutar
 
     # 🆕 İndirim bilgileri — şeffaflık için (eski pricing'ten alınsa da bilgi amaçlı)
     arac_liste_fiyat = float(pricing.get("arac_alt_toplam") or arac_toplam)
@@ -8029,7 +8068,7 @@ async def calculate_konsinye_earning_for_reservation(rez: dict, vehicle: Optiona
         ekkm = float(u.get("ek_km_tutar") or 0)
         uzatma_arac += max(0.0, ekt - ekhz - ekkm)
 
-    brut = round(arac_toplam + uzatma_arac + ek_km_satin_alim_tutar, 2)
+    brut = round(arac_toplam, 2)  # ✅ Ek KM ve uzatma zaten arac_toplam içinde (çift sayım yok)
     devlet_kesinti = round(DEVLET_KESINTI_GUNLUK * gun, 2)
     net = max(0.0, round(brut - devlet_kesinti, 2))
     sahibin_hakkedisi = round(net * pay_yuzde / 100.0, 2)
