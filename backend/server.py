@@ -450,6 +450,26 @@ import time as _time
 _settings_cache: dict = {}
 _settings_cache_ts: float = 0.0
 
+# ⚡ GENEL TTL CACHE
+import time as _time
+_cache_store: dict = {}
+_cache_ts_map: dict = {}
+
+def _cache_get(key: str, ttl: float):
+    ts = _cache_ts_map.get(key, 0.0)
+    if _time.time() - ts < ttl and key in _cache_store:
+        return _cache_store[key]
+    return None
+
+def _cache_set(key: str, value) -> None:
+    _cache_store[key] = value
+    _cache_ts_map[key] = _time.time()
+
+def _cache_invalidate(*keys: str) -> None:
+    for k in keys:
+        _cache_store.pop(k, None)
+        _cache_ts_map.pop(k, None)
+
 async def get_settings() -> dict:
     global _settings_cache, _settings_cache_ts
     now_ts = _time.monotonic()
@@ -2505,7 +2525,10 @@ async def admin_send_test_push(user: dict = Depends(require_admin)):
 # ==================== CUSTOMER: Vehicles ====================
 @api.get("/vehicles")
 async def list_vehicles(user: dict = Depends(require_customer)):
-    # ⚡ Liste yanıtında BÜYÜK alanları HARİÇ tut (fotograflar detayda yüklenir)
+    # ⚡ CACHE: 60s — Atlas M0'a gereksiz yük bindirmeyi önler
+    _cv = _cache_get("vehicles_list", 60)
+    if _cv is not None:
+        return _cv
     proj = {"_id": 0, "fotograflar": 0, "aciklama_detay": 0, "kontrat_html": 0}
     docs = await db.vehicles.find({}, proj).sort([("siralama", 1), ("gunluk_fiyat", 1)]).to_list(200)
     # Mesai başı saatini ve TR saatini al
@@ -2575,6 +2598,7 @@ async def list_vehicles(user: dict = Depends(require_customer)):
         v["availability_info"] = availability_info
         v["next_reservation_at"] = next_rez["bas"] if next_rez else None
         out.append(v)
+    _cache_set("vehicles_list", out)
     return out
 
 @api.get("/vehicles/{vid}")
@@ -2770,9 +2794,13 @@ async def vehicle_availability(vid: str, user: dict = Depends(require_customer))
 # ==================== CUSTOMER: Services ====================
 @api.get("/services")
 async def list_services(user: dict = Depends(require_customer), vehicle_id: Optional[str] = None):
-    docs = await db.services.find({"aktif": True}, {"_id": 0}).sort("siralama", 1).to_list(50)
+    # ⚡ CACHE: 5 dakika
+    _cs = _cache_get("services_list", 300)
+    if _cs is None:
+        _cs = await db.services.find({"aktif": True}, {"_id": 0}).sort("siralama", 1).to_list(50)
+        _cache_set("services_list", _cs)
+    docs = _cs
     if vehicle_id:
-        # Sadece bu araca uygun olanları filtrele (arac_ids boş = tüm araçlar)
         docs = [d for d in docs if not d.get("arac_ids") or vehicle_id in d.get("arac_ids", [])]
     return docs
 
@@ -4183,13 +4211,23 @@ async def mark_all_read(user: dict = Depends(require_customer)):
 # ==================== Public Settings ====================
 @api.get("/settings/public")
 async def public_settings():
-    s = await db.settings.find_one({"key": "company"}, {"_id": 0})
-    return s or {}
+    # ⚡ CACHE: 60s
+    _cp = _cache_get("settings_public", 60)
+    if _cp is not None:
+        return _cp
+    _cp = await db.settings.find_one({"key": "company"}, {"_id": 0}) or {}
+    _cache_set("settings_public", _cp)
+    return _cp
 
 @api.get("/holidays/public")
 async def public_holidays():
-    docs = await db.holidays.find({}, {"_id": 0}).sort("tarih", 1).to_list(200)
-    return docs
+    # ⚡ CACHE: 5 dakika
+    _ch = _cache_get("holidays_public", 300)
+    if _ch is not None:
+        return _ch
+    _ch = await db.holidays.find({}, {"_id": 0}).sort("tarih", 1).to_list(200)
+    _cache_set("holidays_public", _ch)
+    return _ch
 
 
 # ==================== SPONSORS / İŞ ORTAKLARI ====================
@@ -4206,6 +4244,10 @@ class SponsorIn(BaseModel):
 @api.get("/sponsors/public")
 async def public_sponsors():
     """Müşteri tarafı — sadece aktif sponsorlar, sıralanmış."""
+    # ⚡ CACHE: 5 dakika
+    _csp = _cache_get("sponsors_public", 300)
+    if _csp is not None:
+        return _csp
     docs = await db.sponsors.find({"aktif": True}, {"_id": 0}).sort("sira", 1).to_list(100)
     # geriye dönük: eski 'icon' (tekil) -> 'icons' (liste) normalize
     for d in docs:
@@ -4213,6 +4255,7 @@ async def public_sponsors():
             d["icons"] = [d["icon"]]
         elif not d.get("icons"):
             d["icons"] = []
+    _cache_set("sponsors_public", docs)
     return docs
 
 @api.get("/admin/sponsors")
@@ -4758,20 +4801,24 @@ async def admin_create_vehicle(body: VehicleCreate, _: dict = Depends(require_ad
     elif v.get("foto_url") and not v.get("fotograflar"):
         v["fotograflar"] = [v["foto_url"]]
     await db.vehicles.insert_one(dict(v))
-    return await db.vehicles.find_one({"id": v["id"]}, {"_id": 0})
+    _cache_invalidate("vehicles_list")
+    v.pop("_id", None)
+    return dict(v)
 
 @api.put("/admin/vehicles/{vid}")
 async def admin_update_vehicle(vid: str, body: VehicleUpdate, _: dict = Depends(require_admin)):
-    # exclude_unset=True: sadece istemcinin gerçekten gönderdiği alanları al.
-    # None değerleri SAKLA — özellikle manuel_durum=None "Otomatik" durumuna geçişi için kritik.
+    # ⚡ PERFORMANS: Önce çek (404 + merge), sonra güncelle, re-fetch YOK
+    _vex = await db.vehicles.find_one({"id": vid}, {"_id": 0})
+    if not _vex:
+        raise HTTPException(404, "Araç bulunamadı")
     upd = body.dict(exclude_unset=True)
-    # fotograflar gönderildi ise foto_url'i ilk fotoyla senkronize et
     if "fotograflar" in upd:
         fl = upd.get("fotograflar") or []
         upd["foto_url"] = fl[0] if fl else ""
     if upd:
         await db.vehicles.update_one({"id": vid}, {"$set": upd})
-    return await db.vehicles.find_one({"id": vid}, {"_id": 0})
+    _cache_invalidate("vehicles_list")
+    return {**_vex, **upd}
 
 @api.put("/admin/vehicles/order")
 async def admin_reorder_vehicles(payload: dict, _: dict = Depends(require_admin)):
@@ -4793,6 +4840,7 @@ async def admin_reorder_vehicles(payload: dict, _: dict = Depends(require_admin)
 @api.delete("/admin/vehicles/{vid}")
 async def admin_delete_vehicle(vid: str, _: dict = Depends(require_admin)):
     await db.vehicles.delete_one({"id": vid})
+    _cache_invalidate("vehicles_list")
     return {"ok": True}
 
 class MotorBlokajIn(BaseModel):
@@ -4928,10 +4976,10 @@ async def admin_set_reservation_status(rid: str, durum: str, _: dict = Depends(r
             pass
 
     await db.reservations.update_one({"id": rid}, {"$set": update_doc})
-    # tamamlandi'ya geçildi mi? Otomatik giden fatura oluştur (idempotent — zaten varsa atlar) + müşteriye yorum bildirimi
     if durum == "tamamlandi" and eski_durum != "tamamlandi":
         try:
-            updated_res = await db.reservations.find_one({"id": rid}, {"_id": 0})
+            updated_res = {**r, **update_doc}  # ⚡ re-fetch yerine merge
+            updated_res.pop("_id", None)
             if updated_res:
                 await _create_giden_fatura(updated_res)
         except Exception as e:
@@ -4950,7 +4998,9 @@ async def admin_set_reservation_status(rid: str, durum: str, _: dict = Depends(r
             })
         except Exception:
             pass
-    return await db.reservations.find_one({"id": rid}, {"_id": 0})
+    _r_result = {**r, **update_doc}
+    _r_result.pop("_id", None)
+    return _r_result
 
 # Admin: Tam rezervasyon düzenleme
 class AdminReservationUpdate(BaseModel):
@@ -4978,20 +5028,22 @@ class AdminReservationUpdate(BaseModel):
 @api.put("/admin/reservations/{rid}")
 async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict = Depends(require_admin)):
     upd = {k: v for k, v in body.dict().items() if v is not None}
-    # auto_recalc_total bayrağı upd'a girmesin, ayır
     auto_recalc = upd.pop("auto_recalc_total", True)
     recalc_toplam = bool(upd.pop("recalc_toplam_tutar", False))
     recalc_paket_km = bool(upd.pop("recalc_paket_km", False))
     if not upd and not recalc_toplam and not recalc_paket_km:
         raise HTTPException(400, "Güncellenecek alan yok")
+    # ⚡ PERFORMANS: TEK SORGUDA ön-çek — 8+ koşullu find_one → 1 find_one
+    _rez = await db.reservations.find_one({"id": rid}, {"_id": 0})
+    if not _rez:
+        raise HTTPException(404, "Rezervasyon bulunamadı")
     if "baslangic_tarihi" in upd and "bitis_tarihi" in upd:
         bs = parse_iso(upd["baslangic_tarihi"]); bt = parse_iso(upd["bitis_tarihi"])
         if bt <= bs:
             raise HTTPException(400, "Bitiş tarihi başlangıçtan sonra olmalı")
         upd["gun_sayisi"] = calc_days(bs, bt)
     elif "bitis_tarihi" in upd:
-        # Sadece bitiş tarihi değişti — mevcut başlangıçla gün sayısını yeniden hesapla
-        r = await db.reservations.find_one({"id": rid}, {"_id": 0, "baslangic_tarihi": 1})
+        r = _rez  # ⚡ pre-fetched
         if r:
             try:
                 bs = parse_iso(r["baslangic_tarihi"]); bt = parse_iso(upd["bitis_tarihi"])
@@ -5000,8 +5052,7 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
             except Exception:
                 pass
     elif "baslangic_tarihi" in upd:
-        # Sadece başlangıç tarihi değişti
-        r = await db.reservations.find_one({"id": rid}, {"_id": 0, "bitis_tarihi": 1})
+        r = _rez  # ⚡ pre-fetched
         if r:
             try:
                 bs = parse_iso(upd["baslangic_tarihi"]); bt = parse_iso(r["bitis_tarihi"])
@@ -5013,7 +5064,7 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
     # NEW: secilen_hizmetler değişti mi? — toplam_tutar'ı otomatik yeniden hesapla
     if "secilen_hizmetler" in upd and auto_recalc:
         try:
-            cur_r = await db.reservations.find_one({"id": rid}, {"_id": 0}) or {}
+            cur_r = _rez  # ⚡ pre-fetched
             vid = cur_r.get("vehicle_id")
             vehicle = await db.vehicles.find_one({"id": vid}, {"_id": 0}) if vid else None
             if vehicle:
@@ -5036,7 +5087,7 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
     # kademelere ve mevcut konfigürasyona göre toplam tutar / paket km yeniden hesapla
     if recalc_toplam or recalc_paket_km:
         try:
-            cur_r = await db.reservations.find_one({"id": rid}, {"_id": 0}) or {}
+            cur_r = _rez  # ⚡ pre-fetched
             vid = cur_r.get("vehicle_id")
             vehicle = await db.vehicles.find_one({"id": vid}, {"_id": 0}) if vid else None
             if vehicle:
@@ -5078,7 +5129,7 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
     # bile pricing alt-objesini güncelle. Aksi takdirde konsinye hesabı yanlış çalışır.
     if "pricing" not in upd and ("gun_sayisi" in upd or "baslangic_tarihi" in upd or "bitis_tarihi" in upd):
         try:
-            cur_r = await db.reservations.find_one({"id": rid}, {"_id": 0}) or {}
+            cur_r = _rez  # ⚡ pre-fetched
             vid = cur_r.get("vehicle_id")
             vehicle = await db.vehicles.find_one({"id": vid}, {"_id": 0}) if vid else None
             if vehicle:
@@ -5098,7 +5149,7 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
 
     # Ödeme alanları değiştiyse: kalan_odeme ve odeme_durumu yeniden hesapla
     if "odenen_ucret" in upd or "toplam_tutar" in upd:
-        cur = await db.reservations.find_one({"id": rid}, {"_id": 0}) or {}
+        cur = _rez  # ⚡ pre-fetched
         toplam = float(upd.get("toplam_tutar", cur.get("toplam_tutar", 0)) or 0)
         odenen = float(upd.get("odenen_ucret", cur.get("odenen_ucret", 0)) or 0)
         on_odeme = float(cur.get("on_odeme_tutar", 0) or 0)
@@ -5151,14 +5202,16 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
     # Muhasebe: Tarih değiştiyse giden faturayı güncelle
     if "gun_sayisi" in upd or "baslangic_tarihi" in upd:
         try:
-            yeni = await db.reservations.find_one({"id": rid}, {"_id": 0})
-            if yeni:
-                # Yeni mantık: _create_giden_fatura aya bölünmüş çoklu fatura'yı oluşturur/günceller
-                await _create_giden_fatura(yeni)
+            _yeni = {**_rez, **upd}  # ⚡ re-fetch yerine merge
+            _yeni.pop("_id", None)
+            await _create_giden_fatura(_yeni)
         except Exception as e:
             logger.warning(f"admin_update: muhasebe fatura güncellenemedi rid={rid}: {e}")
 
-    return await db.reservations.find_one({"id": rid}, {"_id": 0})
+    # ⚡ re-fetch yerine merge
+    _result = {**_rez, **upd}
+    _result.pop("_id", None)
+    return _result
 
 @api.delete("/admin/reservations/{rid}")
 async def admin_delete_reservation(rid: str, refund: bool = True, _: dict = Depends(require_admin)):
@@ -5352,8 +5405,11 @@ async def admin_delete_teslim_foto(rid: str, fid: str, _: dict = Depends(require
 async def admin_set_payment_status(rid: str, odeme_durumu: str, _: dict = Depends(require_admin)):
     if odeme_durumu not in ("beklemede", "on_odeme_alindi", "tam_odeme_alindi"):
         raise HTTPException(400, "Geçersiz ödeme durumu")
+    _rod = await db.reservations.find_one({"id": rid}, {"_id": 0})
+    if not _rod:
+        raise HTTPException(404, "Rezervasyon bulunamadı")
     await db.reservations.update_one({"id": rid}, {"$set": {"odeme_durumu": odeme_durumu}})
-    return await db.reservations.find_one({"id": rid}, {"_id": 0})
+    return {**_rod, "odeme_durumu": odeme_durumu}
 
 class KmOtoKilitIn(BaseModel):
     aktif: bool = True
@@ -5439,7 +5495,8 @@ async def admin_set_km(rid: str, alis_km: Optional[int] = None, guncel_km: Optio
                         "okuyanlar": [],
                     })
     await db.reservations.update_one({"id": rid}, {"$set": upd})
-    return await db.reservations.find_one({"id": rid}, {"_id": 0})
+    _km = {**r, **upd}; _km.pop("_id", None)
+    return _km
 
 # Manuel rezervasyon
 @api.post("/admin/reservations/manual")
@@ -5979,10 +6036,14 @@ async def admin_create_service(body: ServiceCreate, _: dict = Depends(require_ad
 
 @api.put("/admin/services/{sid}")
 async def admin_update_service(sid: str, body: ServiceUpdate, _: dict = Depends(require_admin)):
+    _sex = await db.services.find_one({"id": sid}, {"_id": 0})
+    if not _sex:
+        raise HTTPException(404, "Hizmet bulunamadı")
     upd = {k: v for k, v in body.dict().items() if v is not None}
     if upd:
         await db.services.update_one({"id": sid}, {"$set": upd})
-    return await db.services.find_one({"id": sid}, {"_id": 0})
+    _cache_invalidate("services_list")
+    return {**_sex, **upd}
 
 @api.delete("/admin/services/{sid}")
 async def admin_delete_service(sid: str, _: dict = Depends(require_admin)):
@@ -6214,12 +6275,17 @@ async def admin_update_settings(body: SettingsUpdate, _: dict = Depends(require_
     upd = {k: v for k, v in body.dict().items() if v is not None}
     if upd:
         await db.settings.update_one({"key": "company"}, {"$set": upd}, upsert=True)
+    _cache_invalidate("settings_public", "holidays_public")
     return await db.settings.find_one({"key": "company"}, {"_id": 0})
 
 # ==================== ADMIN: Dashboard ====================
 @api.get("/admin/dashboard")
 async def admin_dashboard(_: dict = Depends(require_admin)):
-    return {
+    # ⚡ CACHE: 30s
+    _cdash = _cache_get("admin_dashboard", 30)
+    if _cdash is not None:
+        return _cdash
+    _cdash = {
         "musteri_sayisi": await db.customers.count_documents({}),
         "engelli_musteri": await db.customers.count_documents({"blocked": True}),
         "arac_sayisi": await db.vehicles.count_documents({}),
@@ -6230,6 +6296,8 @@ async def admin_dashboard(_: dict = Depends(require_admin)):
         "bekleyen_yorum": await db.reviews.count_documents({"durum": "beklemede"}),
         "bot_online": (await fetch_bot_vehicles()) is not None,
     }
+    _cache_set("admin_dashboard", _cdash)
+    return _cdash
 
 
 # ========================================================================
@@ -6316,10 +6384,15 @@ async def list_vehicle_reviews(vid: str, min_yildiz: int = 0, limit: int = 50):
 @api.get("/reviews/featured")
 async def list_featured_reviews(limit: int = 5):
     """Public — ana sayfa için en yüksek puanlı onaylanmış yorumlar (yorum metni dolu olanlar)."""
+    # ⚡ CACHE: 2 dakika
+    _crf = _cache_get("reviews_featured", 120)
+    if _crf is not None:
+        return _crf
     docs = await db.reviews.find(
         {"durum": "onaylandi", "yorum": {"$ne": ""}},
         {"_id": 0}
     ).sort([("arac_puan", -1), ("servis_puan", -1), ("tarih", -1)]).limit(limit).to_list(limit)
+    _cache_set("reviews_featured", docs)
     return docs
 
 
@@ -6340,12 +6413,16 @@ async def admin_list_reviews(durum: Optional[str] = None, _: dict = Depends(requ
 
 @api.put("/admin/reviews/{rid}")
 async def admin_update_review(rid: str, body: ReviewAdminUpdate, _: dict = Depends(require_admin)):
+    _revex = await db.reviews.find_one({"id": rid}, {"_id": 0})
+    if not _revex:
+        raise HTTPException(404, "Yorum bulunamadı")
     upd = body.dict(exclude_unset=True)
     if "durum" in upd and upd["durum"] == "onaylandi":
         upd["onayli_tarih"] = now_iso()
     if upd:
         await db.reviews.update_one({"id": rid}, {"$set": upd})
-    return await db.reviews.find_one({"id": rid}, {"_id": 0})
+    _cache_invalidate("reviews_featured")
+    return {**_revex, **upd}
 
 
 @api.delete("/admin/reviews/{rid}")
@@ -6566,7 +6643,7 @@ async def admin_update_manual_income(iid: str, body: ManualIncomeUpdate, _: dict
         upd["kasa"] = _norm_kasa(body.kasa)
     if upd:
         await db.manual_incomes.update_one({"id": iid}, {"$set": upd})
-    return await db.manual_incomes.find_one({"id": iid}, {"_id": 0})
+    return {**existing, **upd}
 
 
 @api.delete("/admin/manual-incomes/{iid}")
@@ -7561,7 +7638,7 @@ async def admin_update_gelen_fatura(iid: str, body: GelenFaturaUpdate, _: dict =
     upd["kdv_tutar"] = kdv_tutar
     upd["toplam_tutar"] = round(kdv_haric + kdv_tutar, 2)
     await db.invoices.update_one({"id": iid}, {"$set": upd})
-    return await db.invoices.find_one({"id": iid}, {"_id": 0})
+    return {**existing, **upd}
 
 
 @api.delete("/admin/invoices/{iid}")
@@ -7609,7 +7686,7 @@ async def admin_update_giden_fatura(iid: str, body: GidenFaturaUpdate, _: dict =
     upd["auto_generated"] = False  # Admin elle düzenledi → otomatik mekanizma dokunmasın
     upd["updated_at"] = now_iso()
     await db.invoices.update_one({"id": iid}, {"$set": upd})
-    return await db.invoices.find_one({"id": iid}, {"_id": 0})
+    return {**existing, **upd}
 
 
 @api.get("/admin/accounting/years")
@@ -8004,12 +8081,17 @@ def require_admin_or_konsinye(user: dict = Depends(get_current_user)) -> dict:
 @api.get("/admin/konsinyatorler")
 async def admin_list_konsinyatorler(user: dict = Depends(require_admin)):
     items = await db.konsinyatorler.find({"$or": [{"tenant_id": tenant_id_of(user)}, {"tenant_id": {"$exists": False}}]} if not is_super_admin(user) else {}, {"_id": 0}).sort([("ad", 1)]).to_list(500)
-    # Her konsinyatör için araç sayısı + toplam hak ediş özeti ekle
-    out = []
-    for k in items:
-        v_count = await db.vehicles.count_documents({"konsinye_sahibi_id": k["id"]})
-        out.append({**k, "arac_sayisi": v_count})
-    return out
+    # ⚡ N+1 FIX: araç sayısını TEK aggregate ile çek
+    _kk_ids = [k["id"] for k in items]
+    _v_cnts: dict = {}
+    if _kk_ids:
+        _kpipe = [
+            {"$match": {"konsinye_sahibi_id": {"$in": _kk_ids}}},
+            {"$group": {"_id": "$konsinye_sahibi_id", "cnt": {"$sum": 1}}},
+        ]
+        for _krow in await db.vehicles.aggregate(_kpipe).to_list(len(_kk_ids) + 10):
+            _v_cnts[_krow["_id"]] = int(_krow["cnt"])
+    return [{**k, "arac_sayisi": _v_cnts.get(k["id"], 0)} for k in items]
 
 
 @api.post("/admin/konsinyatorler")
@@ -8060,12 +8142,12 @@ async def admin_update_konsinyator(kid: str, body: KonsinyatorUpdate, _: dict = 
         upd["tc_norm"] = tc
     if "varsayilan_pay_yuzde" in upd and upd["varsayilan_pay_yuzde"] is not None:
         upd["varsayilan_pay_yuzde"] = max(0.0, min(100.0, float(upd["varsayilan_pay_yuzde"])))
+    _konsex = await db.konsinyatorler.find_one({"id": kid}, {"_id": 0})
+    if not _konsex:
+        raise HTTPException(404, "Konsinye sahibi bulunamadı")
     if upd:
         await db.konsinyatorler.update_one({"id": kid}, {"$set": upd})
-    k = await db.konsinyatorler.find_one({"id": kid}, {"_id": 0})
-    if not k:
-        raise HTTPException(404, "Konsinye sahibi bulunamadı")
-    return k
+    return {**_konsex, **upd}
 
 
 @api.delete("/admin/konsinyatorler/{kid}")
