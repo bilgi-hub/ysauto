@@ -3452,6 +3452,16 @@ async def _extend_logic(r: dict, body: ReservationExtend, charge_balance: bool =
         "uzatma_sayisi": int(r.get("uzatma_sayisi") or 0) + 1,
         "son_uzatma_tarih": now_iso(),
     }
+    # 🆕 İşlem geçmişi — Kazançlar sayfasında aylara göre paylaşım için
+    islem_kaydi = {
+        "tip": "uzatma",
+        "tarih": now_iso(),
+        "tutar": ek_tutar,
+        "ek_arac_tutar": float(q.get("ek_arac_tutar") or 0),
+        "ek_hizmet_tutar": float(q.get("ek_hizmet_tutar") or 0),
+        "ek_km_tutar": float(q.get("ek_km_tutar") or 0),
+        "ek_gun": int(q.get("ek_gun") or 0),
+    }
 
     # Bakiyeden çek (sadece müşteri)
     if charge_balance and ek_tutar > 0:
@@ -3468,7 +3478,7 @@ async def _extend_logic(r: dict, body: ReservationExtend, charge_balance: bool =
         except Exception as e:
             raise HTTPException(500, f"Bakiye işlemi başarısız: {e}")
 
-    await db.reservations.update_one({"id": rid}, {"$set": update_doc})
+    await db.reservations.update_one({"id": rid}, {"$set": update_doc, "$push": {"islemler": islem_kaydi}})
 
     # Bildirim
     try:
@@ -5209,7 +5219,40 @@ async def admin_edit_reservation(rid: str, body: AdminReservationUpdate, _: dict
         except Exception as e:
             logger.warning(f"admin_edit notlar append başarısız rid={rid}: {e}")
 
-    await db.reservations.update_one({"id": rid}, {"$set": upd})
+    # 🆕 AKILLI UZATMA TESPİTİ — manuel düzenle ile bitiş + tutar artarsa islemler[]'e push
+    push_ops = {}
+    try:
+        old_bitis_str = _rez.get("bitis_tarihi")
+        old_toplam = float(_rez.get("toplam_tutar") or 0)
+        new_bitis_str = upd.get("bitis_tarihi") or old_bitis_str
+        new_toplam = float(upd.get("toplam_tutar", old_toplam))
+        if old_bitis_str and new_bitis_str and new_toplam > old_toplam:
+            old_bt = parse_iso(old_bitis_str)
+            new_bt = parse_iso(new_bitis_str)
+            if new_bt > old_bt:
+                delta_tutar = round(new_toplam - old_toplam, 2)
+                delta_gun = max(1, calc_days(old_bt, new_bt))
+                islem_kaydi = {
+                    "tip": "uzatma",
+                    "tarih": old_bitis_str,  # eski bitiş = yeni periyodun başlangıcı
+                    "tutar": delta_tutar,
+                    "ek_arac_tutar": delta_tutar,
+                    "ek_hizmet_tutar": 0.0,
+                    "ek_km_tutar": 0.0,
+                    "ek_gun": delta_gun,
+                    "kaynak": "edit",
+                }
+                push_ops["islemler"] = islem_kaydi
+                # Düzenle aynı zamanda uzatma istatistiklerini de yenilesin
+                upd["uzatma_sayisi"] = int(_rez.get("uzatma_sayisi") or 0) + 1
+                upd["son_uzatma_tarih"] = now_iso()
+    except Exception as e:
+        logger.warning(f"admin_edit uzatma tespit hatası rid={rid}: {e}")
+
+    update_ops = {"$set": upd}
+    if push_ops:
+        update_ops["$push"] = push_ops
+    await db.reservations.update_one({"id": rid}, update_ops)
 
     # Muhasebe: Tarih değiştiyse giden faturayı güncelle
     if "gun_sayisi" in upd or "baslangic_tarihi" in upd:
@@ -5849,7 +5892,15 @@ async def admin_ek_km_sat(rid: str, body: EkKmSatisIn, current: dict = Depends(r
         "metin": note_msg,
     })
     upd["notlar"] = notlar
-    await db.reservations.update_one({"id": rid}, {"$set": upd})
+    # 🆕 İşlem kaydı — Kazançlar sayfasında ek_km doğru aya yazılsın (satış)
+    islem_kaydi = {
+        "tip": "ek_km",
+        "tarih": now_iso(),
+        "tutar": float(tutar),
+        "ek_km_tutar": float(tutar),
+        "ek_km_satin": int(body.ek_km),
+    }
+    await db.reservations.update_one({"id": rid}, {"$set": upd, "$push": {"islemler": islem_kaydi}})
     # Bildirim (müşteriye)
     try:
         await db.notifications.insert_one({
@@ -7067,11 +7118,18 @@ async def admin_earnings(
         })
 
     manuel_gelir = 0.0
+    manuel_gelir_rentcar = 0.0
+    manuel_gelir_eticaret = 0.0
     for mi in manual_incomes:
         amt = float(mi.get("tutar") or 0)
         if amt <= 0:
             continue
         manuel_gelir += amt
+        mi_kasa = (mi.get("kasa") or "").lower()
+        if mi_kasa == "rentcar":
+            manuel_gelir_rentcar += amt
+        elif mi_kasa == "eticaret":
+            manuel_gelir_eticaret += amt
         gelir_kalemleri.append({
             "id": mi.get("id"),
             "tarih": mi.get("tarih"),
@@ -7096,6 +7154,8 @@ async def admin_earnings(
         "toplam_gelir": round(toplam_gelir, 2),
         "rezervasyon_gelir": round(rezervasyon_gelir, 2),
         "manuel_gelir": round(manuel_gelir, 2),
+        "manuel_gelir_rentcar": round(manuel_gelir_rentcar, 2),
+        "manuel_gelir_eticaret": round(manuel_gelir_eticaret, 2),
         # 🤝 KONSİNYE BREAKDOWN (yeni)
         "konsinye_net_pay": round(konsinye_net_pay, 2),  # YS Auto'nun konsinye'den NET payı
         "konsinye_brut_gelir": round(konsinye_brut_gelir, 2),  # Konsinye rez. tam tutar (bilgi)
@@ -7155,18 +7215,70 @@ async def admin_vehicle_performance(
         except Exception:
             r_bas, r_bit = None, None
             total_seconds, total_days = 1.0, 1.0
-        # Dönemle çakışma oranı
-        if period_start and period_end and r_bas and r_bit:
-            ov_start = max(r_bas, period_start)
-            ov_end = min(r_bit, period_end)
-            overlap_seconds = max(0.0, (ov_end - ov_start).total_seconds())
-            overlap_days = overlap_seconds / 86400.0
+
+        # 🎯 AYLIK ATAMA — kullanıcı mantığı:
+        #  - Original (rez ilk açıldığında alınan tutar) → BAŞLANGIÇ ayı
+        #  - Her uzatma → uzatmanın yapıldığı ay (islemler[].tarih)
+        #  - Her ek_km → satıldığı ay (islemler[].tarih)
+        #  - Eski rez (islemler[] yok ama uzatması var) → orijinal başlangıç ay'a, uzatma kısmı bitiş ay'a
+        #  - Eski rez (islemler[] yok ve uzatma yok) → tamamı başlangıç ay'a
+        toplam_tutar_total = float(r.get("toplam_tutar") or 0)
+        islemler = r.get("islemler") or []
+        kalemler = []  # her: { tutar, tarih }
+        if islemler:
+            islem_total = sum(max(0.0, float(i.get("tutar") or 0)) for i in islemler)
+            original_tutar = max(0.0, toplam_tutar_total - islem_total)
+            if original_tutar > 0 and r_bas:
+                kalemler.append({"tutar": original_tutar, "tarih": r_bas})
+            for islem in islemler:
+                t = islem.get("tarih")
+                if not t:
+                    continue
+                try:
+                    tt = parse_iso(t)
+                except Exception:
+                    continue
+                amt = float(islem.get("tutar") or 0)
+                if amt > 0:
+                    kalemler.append({"tutar": amt, "tarih": tt})
         else:
-            overlap_seconds = total_seconds
-            overlap_days = total_days
-        oran = min(1.0, max(0.0, overlap_seconds / total_seconds)) if total_seconds > 0 else 1.0
-        if oran <= 0:
+            # Eski rez — islemler yok
+            uzatma_sayisi = int(r.get("uzatma_sayisi") or 0)
+            if uzatma_sayisi > 0:
+                # Uzatma var ama detay yok — pricing'den orijinal araç tutarı çıkarılır, geri kalan uzatma kabul edilir
+                pricing_arac = float((r.get("pricing") or {}).get("arac_toplam") or 0)
+                pricing_hizmet = float((r.get("pricing") or {}).get("hizmetler_toplam") or 0)
+                # Orijinal = base hesaba bak (pricing yetersizse toplam'ı başlangıca yaz)
+                if pricing_arac > 0 or pricing_hizmet > 0:
+                    # Toplam tutar = orijinal + uzatma. Pricing toplamından geri kalan uzatma kısmı.
+                    pricing_toplam = pricing_arac + pricing_hizmet
+                    if pricing_toplam < toplam_tutar_total:
+                        uzatma_kismi = toplam_tutar_total - pricing_toplam
+                        if r_bas:
+                            kalemler.append({"tutar": pricing_toplam, "tarih": r_bas})
+                        if uzatma_kismi > 0 and r_bit:
+                            kalemler.append({"tutar": uzatma_kismi, "tarih": r_bit})
+                    else:
+                        # Pricing kapsıyor — tamamı başlangıca
+                        if r_bas:
+                            kalemler.append({"tutar": toplam_tutar_total, "tarih": r_bas})
+                elif r_bas:
+                    kalemler.append({"tutar": toplam_tutar_total, "tarih": r_bas})
+            else:
+                # Uzatma yok — tamamı başlangıç ayına
+                if r_bas:
+                    kalemler.append({"tutar": toplam_tutar_total, "tarih": r_bas})
+
+        # Dönem filtresi — bu dönemde kaç TL var?
+        if period_start and period_end:
+            in_period_total = sum(k["tutar"] for k in kalemler if k["tarih"] and (period_start <= k["tarih"] <= period_end))
+        else:
+            in_period_total = sum(k["tutar"] for k in kalemler)
+        if in_period_total <= 0:
             continue
+
+        oran = min(1.0, in_period_total / toplam_tutar_total) if toplam_tutar_total > 0 else 1.0
+        overlap_days = total_days * oran
 
         pricing = r.get("pricing") or {}
         rez_gun = int(r.get("gun_sayisi") or r.get("toplam_gun") or 0)
