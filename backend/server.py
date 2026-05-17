@@ -4575,8 +4575,8 @@ async def admin_vehicles_available_at(
     _: dict = Depends(require_admin),
 ):
     """Belirli bir hedef tarih için araç müsaitliğini ve yakında dönenleri listeler.
-    - musait: hedef anda dolu olmayan araçlar
-    - yaklasan: şu an dolu ama dönüş tarihi hedef tarihten ±tolerance gün içinde olan araçlar
+    - musait: hedef GÜN ile çakışan rezervasyonu olmayan araçlar (00:00–23:59 tüm gün kontrol)
+    - yaklasan: o gün dolu ama dönüş tarihi hedef tarihten ±tolerance gün içinde olan araçlar
     """
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     try:
@@ -4589,6 +4589,12 @@ async def admin_vehicles_available_at(
             target_tr = target_utc + _td(hours=3)
     except Exception:
         raise HTTPException(400, "target_iso geçersiz")
+
+    # 🆕 Hedef günün TR yerel başlangıcı (00:00) ve bitişi (23:59:59.999) — UTC'ye çevrilmiş
+    day_start_tr = target_tr.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end_tr = target_tr.replace(hour=23, minute=59, second=59, microsecond=999000)
+    day_start_utc = day_start_tr - _td(hours=3)
+    day_end_utc = day_end_tr - _td(hours=3)
 
     s = await get_settings()
     mesai_baslangic = s.get("mesai_baslangic", "09:00")
@@ -4630,8 +4636,8 @@ async def admin_vehicles_available_at(
     for v in vehicles:
         vid = v.get("id")
         v_rezler = res_by_vehicle.get(vid, [])
-        # Hedef anı kapsayan rezervasyon var mı?
-        cakisma = next((r for r in v_rezler if r["bas"] <= target_utc < r["bit"]), None)
+        # 🆕 Hedef GÜN ile çakışan rezervasyon var mı? (overlap check: bas < day_end AND bit > day_start)
+        cakisma = next((r for r in v_rezler if r["bas"] < day_end_utc and r["bit"] > day_start_utc), None)
         # En yakın dönüş (hedef öncesi/sonrası fark etmez, mutlak değere göre)
         nearest_return = None
         nearest_gap_seconds = None
@@ -4687,6 +4693,118 @@ async def admin_vehicles_available_at(
         "musait_count": len(musait),
         "yaklasan_count": len(yaklasan),
     }
+
+
+# Admin: belirli bir tarih ARALIĞI için müsait + yakında dönen araçlar
+@api.get("/admin/vehicles/available-range")
+async def admin_vehicles_available_range(
+    start_iso: str = Query(..., description="Kiralama başlangıcı ISO (TR yerel)"),
+    end_iso: str = Query(..., description="Kiralama bitişi ISO (TR yerel)"),
+    tolerance_days: int = Query(2, ge=0, le=14),
+    _: dict = Depends(require_admin),
+):
+    """Belirli bir tarih ARALIĞI için araç müsaitliğini ve yakında dönenleri listeler.
+    - musait: aralıkla çakışan rezervasyonu olmayan araçlar
+    - yaklasan: aralıkla çakışıyor ama dönüş tarihi başlangıç tarihinden ±tolerance gün içinde
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    try:
+        def _parse(s: str):
+            t = _dt.fromisoformat(s.replace('Z', '+00:00'))
+            if t.tzinfo is None:
+                # TR yerel — UTC'ye çevir (TR = UTC+3)
+                return t - _td(hours=3)
+            return t.astimezone(_tz.utc).replace(tzinfo=None)
+        range_start_utc = _parse(start_iso)
+        range_end_utc = _parse(end_iso)
+    except Exception:
+        raise HTTPException(400, "start_iso veya end_iso geçersiz")
+    if range_end_utc <= range_start_utc:
+        raise HTTPException(400, "Bitiş tarihi başlangıçtan büyük olmalı")
+
+    vehicles = await db.vehicles.find({}, {"_id": 0}).sort([("siralama", 1), ("created_at", -1)]).to_list(200)
+    _at_from = (range_start_utc - _td(days=30)).isoformat()
+    _at_to = (range_end_utc + _td(days=60)).isoformat()
+    reservations = await db.reservations.find(
+        {
+            "durum": {"$in": ["aktif", "onaylandi"]},
+            "bitis_tarihi":     {"$gte": _at_from},
+            "baslangic_tarihi": {"$lte": _at_to},
+        },
+        {"_id": 0, "vehicle_id": 1, "baslangic_tarihi": 1, "bitis_tarihi": 1, "durum": 1},
+    ).to_list(2000)
+
+    res_by_vehicle: dict = {}
+    for r in reservations:
+        vid = r.get("vehicle_id")
+        if not vid:
+            continue
+        try:
+            bas = parse_iso(r["baslangic_tarihi"])
+            bit = parse_iso(r["bitis_tarihi"])
+            if bas.tzinfo is not None:
+                bas = bas.astimezone(_tz.utc).replace(tzinfo=None)
+            if bit.tzinfo is not None:
+                bit = bit.astimezone(_tz.utc).replace(tzinfo=None)
+        except Exception:
+            continue
+        res_by_vehicle.setdefault(vid, []).append({"bas": bas, "bit": bit, "durum": r.get("durum")})
+
+    musait = []
+    yaklasan = []
+    tolerance_seconds = tolerance_days * 24 * 3600
+
+    for v in vehicles:
+        vid = v.get("id")
+        v_rezler = res_by_vehicle.get(vid, [])
+        # Aralık ile çakışma: bas < range_end AND bit > range_start
+        cakisma = next((r for r in v_rezler if r["bas"] < range_end_utc and r["bit"] > range_start_utc), None)
+        # Önceki rez bitişi (range_start öncesi son biten)
+        onceki = sorted([r for r in v_rezler if r["bit"] <= range_start_utc], key=lambda x: x["bit"], reverse=True)
+        onceki_bitis = onceki[0]["bit"].isoformat() if onceki else None
+        # Sonraki rez başlangıcı (range_end sonrası ilk başlayan)
+        sonraki = sorted([r for r in v_rezler if r["bas"] >= range_end_utc], key=lambda x: x["bas"])
+        sonraki_baslangic = sonraki[0]["bas"].isoformat() if sonraki else None
+
+        base = {
+            "id": vid,
+            "plaka": v.get("plaka"),
+            "marka": v.get("marka"),
+            "model": v.get("model"),
+            "foto_url": v.get("foto_url"),
+            "gunluk_fiyat": v.get("gunluk_fiyat"),
+            "available": cakisma is None,
+            "next_reservation": sonraki_baslangic,
+            "prev_reservation_end": onceki_bitis,
+        }
+        if cakisma is None:
+            musait.append(base)
+        else:
+            # Dolu — çakışan rez. bitişi range_start'a ±tolerance gün içinde mi?
+            gap = (cakisma["bit"] - range_start_utc).total_seconds()
+            if abs(gap) <= tolerance_seconds:
+                base["return_iso"] = cakisma["bit"].isoformat()
+                base["gap_seconds"] = int(gap)
+                base["gap_hours"] = round(gap / 3600, 1)
+                base["conflict"] = {
+                    "baslangic": cakisma["bas"].isoformat(),
+                    "bitis": cakisma["bit"].isoformat(),
+                    "durum": cakisma["durum"],
+                }
+                yaklasan.append(base)
+
+    yaklasan.sort(key=lambda x: abs(x.get("gap_seconds", 0)))
+
+    return {
+        "range_start": range_start_utc.isoformat(),
+        "range_end": range_end_utc.isoformat(),
+        "tolerance_days": tolerance_days,
+        "musait": musait,
+        "yaklasan": yaklasan,
+        "musait_count": len(musait),
+        "yaklasan_count": len(yaklasan),
+    }
+
 
 
 @api.get("/admin/quote/{vehicle_id}")
@@ -7216,69 +7334,51 @@ async def admin_vehicle_performance(
             r_bas, r_bit = None, None
             total_seconds, total_days = 1.0, 1.0
 
-        # 🎯 AYLIK ATAMA — kullanıcı mantığı:
-        #  - Original (rez ilk açıldığında alınan tutar) → BAŞLANGIÇ ayı
-        #  - Her uzatma → uzatmanın yapıldığı ay (islemler[].tarih)
-        #  - Her ek_km → satıldığı ay (islemler[].tarih)
-        #  - Eski rez (islemler[] yok ama uzatması var) → orijinal başlangıç ay'a, uzatma kısmı bitiş ay'a
-        #  - Eski rez (islemler[] yok ve uzatma yok) → tamamı başlangıç ay'a
+        # 🎯 AYLIK ATAMA — GÜN-BAZLI ORANTI (ÖZET sekmesi ile birebir uyumlu):
+        #  - ORIGINAL kısım (toplam_tutar - islemler) → gün-bazlı orantı (r_bas..r_bit dönem ile çakışma)
+        #  - Her uzatma/ek_km (islemler[]) → işlem tarihinin ayına TAM olarak yansır
         toplam_tutar_total = float(r.get("toplam_tutar") or 0)
         islemler = r.get("islemler") or []
-        kalemler = []  # her: { tutar, tarih }
-        if islemler:
-            islem_total = sum(max(0.0, float(i.get("tutar") or 0)) for i in islemler)
-            original_tutar = max(0.0, toplam_tutar_total - islem_total)
-            if original_tutar > 0 and r_bas:
-                kalemler.append({"tutar": original_tutar, "tarih": r_bas})
-            for islem in islemler:
-                t = islem.get("tarih")
-                if not t:
-                    continue
-                try:
-                    tt = parse_iso(t)
-                except Exception:
-                    continue
-                amt = float(islem.get("tutar") or 0)
-                if amt > 0:
-                    kalemler.append({"tutar": amt, "tarih": tt})
-        else:
-            # Eski rez — islemler yok
-            uzatma_sayisi = int(r.get("uzatma_sayisi") or 0)
-            if uzatma_sayisi > 0:
-                # Uzatma var ama detay yok — pricing'den orijinal araç tutarı çıkarılır, geri kalan uzatma kabul edilir
-                pricing_arac = float((r.get("pricing") or {}).get("arac_toplam") or 0)
-                pricing_hizmet = float((r.get("pricing") or {}).get("hizmetler_toplam") or 0)
-                # Orijinal = base hesaba bak (pricing yetersizse toplam'ı başlangıca yaz)
-                if pricing_arac > 0 or pricing_hizmet > 0:
-                    # Toplam tutar = orijinal + uzatma. Pricing toplamından geri kalan uzatma kısmı.
-                    pricing_toplam = pricing_arac + pricing_hizmet
-                    if pricing_toplam < toplam_tutar_total:
-                        uzatma_kismi = toplam_tutar_total - pricing_toplam
-                        if r_bas:
-                            kalemler.append({"tutar": pricing_toplam, "tarih": r_bas})
-                        if uzatma_kismi > 0 and r_bit:
-                            kalemler.append({"tutar": uzatma_kismi, "tarih": r_bit})
-                    else:
-                        # Pricing kapsıyor — tamamı başlangıca
-                        if r_bas:
-                            kalemler.append({"tutar": toplam_tutar_total, "tarih": r_bas})
-                elif r_bas:
-                    kalemler.append({"tutar": toplam_tutar_total, "tarih": r_bas})
-            else:
-                # Uzatma yok — tamamı başlangıç ayına
-                if r_bas:
-                    kalemler.append({"tutar": toplam_tutar_total, "tarih": r_bas})
+        islem_total = sum(max(0.0, float(i.get("tutar") or 0)) for i in islemler) if islemler else 0.0
+        original_tutar = max(0.0, toplam_tutar_total - islem_total)
 
-        # Dönem filtresi — bu dönemde kaç TL var?
-        if period_start and period_end:
-            in_period_total = sum(k["tutar"] for k in kalemler if k["tarih"] and (period_start <= k["tarih"] <= period_end))
-        else:
-            in_period_total = sum(k["tutar"] for k in kalemler)
+        # 1) ORIGINAL — gün-bazlı orantı
+        in_period_total = 0.0
+        overlap_seconds_orig = 0.0
+        if original_tutar > 0 and r_bas and r_bit:
+            if period_start and period_end:
+                ov_start = max(r_bas, period_start)
+                ov_end = min(r_bit, period_end)
+                overlap_seconds_orig = max(0.0, (ov_end - ov_start).total_seconds())
+                oran_orig = (overlap_seconds_orig / total_seconds) if total_seconds > 0 else 0.0
+                oran_orig = min(1.0, max(0.0, oran_orig))
+            else:
+                overlap_seconds_orig = total_seconds
+                oran_orig = 1.0
+            in_period_total += round(original_tutar * oran_orig, 2)
+
+        # 2) İSLEMLER — her uzatma/ek_km kendi tarihinin ayına TAM gelir
+        for islem in islemler:
+            t = islem.get("tarih")
+            amt = float(islem.get("tutar") or 0)
+            if not t or amt <= 0:
+                continue
+            try:
+                tt = parse_iso(t)
+            except Exception:
+                continue
+            if period_start and period_end:
+                if period_start <= tt <= period_end:
+                    in_period_total += amt
+            else:
+                in_period_total += amt
+
         if in_period_total <= 0:
             continue
 
         oran = min(1.0, in_period_total / toplam_tutar_total) if toplam_tutar_total > 0 else 1.0
-        overlap_days = total_days * oran
+        # Gün sayısı: ORIGINAL kısmın bu dönemdeki gün sayısı (islemler tek gün varsayılır, gün eklenmez)
+        overlap_days = overlap_seconds_orig / 86400.0 if overlap_seconds_orig > 0 else 0.0
 
         pricing = r.get("pricing") or {}
         rez_gun = int(r.get("gun_sayisi") or r.get("toplam_gun") or 0)
