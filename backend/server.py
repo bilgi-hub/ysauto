@@ -7391,7 +7391,9 @@ async def admin_vehicle_performance(
         hiz_pricing = pricing.get("hizmetler") or []
         hiz_extra = r.get("ekstra_hizmetler") or []
         hiz_list = hiz_root if len(hiz_root) > 0 else (hiz_pricing if len(hiz_pricing) > 0 else hiz_extra)
-        hizmetler_toplam_dogru = 0.0
+        hizmetler_toplam_dogru = 0.0  # Toplam hizmet (gunluk + tek_seferlik)
+        hizmetler_tek_seferlik = 0.0  # 🆕 Tek seferlik hizmetler — başlangıç ayına TAM yazılır
+        hizmetler_gunluk = 0.0  # 🆕 Günlük hizmetler — orantılı bölünür
         for h in hiz_list:
             # 🆕 Hizmet sadece {service_id, adet} formatındaysa services_map'ten zenginleştir
             svc = None
@@ -7403,9 +7405,13 @@ async def admin_vehicle_performance(
             tutar_field = float(h.get("tutar") or 0)
             adet = int(h.get("adet") or 1)
             if tip == "gunluk":
-                hizmetler_toplam_dogru += fiyat * adet * max(1, rez_gun or 1)
+                amt = fiyat * adet * max(1, rez_gun or 1)
+                hizmetler_toplam_dogru += amt
+                hizmetler_gunluk += amt
             else:
-                hizmetler_toplam_dogru += tutar_field if tutar_field else (fiyat * adet)
+                amt = tutar_field if tutar_field else (fiyat * adet)
+                hizmetler_toplam_dogru += amt
+                hizmetler_tek_seferlik += amt
 
         km_gelir_full = float(r.get("ek_km_tutar") or 0) + float(r.get("km_asim_tutar") or 0)
         toplam_full = float(r.get("toplam_tutar") or 0)
@@ -7430,11 +7436,22 @@ async def admin_vehicle_performance(
                 arac_gelir_full = round(gf * max(1, rez_gun or 1), 2)
             hizmet_gelir_full = hizmetler_toplam_dogru + float(r.get("ek_hizmet_tutar") or 0)
 
-        # Orantı uygula
+        # 🆕 Hizmet attribution: tek_seferlik FULL to start month, gunluk + ek_hizmet proportional
+        ek_hizmet_tutar = float(r.get("ek_hizmet_tutar") or 0)
+        # Tek seferlik hizmet (yıkama vb.) — başlangıç ayı period içindeyse FULL, değilse 0
+        start_in_period = True
+        if period_start and period_end and r_bas:
+            start_in_period = (period_start <= r_bas <= period_end)
+        tek_sef_in_period = hizmetler_tek_seferlik if start_in_period else 0.0
+        gunluk_in_period = hizmetler_gunluk * oran  # orantılı
+        ek_hizmet_in_period = ek_hizmet_tutar * oran  # orantılı
+
+        # Orantı uygula — arac/km için yine proportional, hizmet için yeni mantık
         arac_gelir = round(arac_gelir_full * oran, 2)
-        hizmet_gelir = round(hizmet_gelir_full * oran, 2)
+        hizmet_gelir = round(gunluk_in_period + tek_sef_in_period + ek_hizmet_in_period, 2)
         km_gelir = round(km_gelir_full * oran, 2)
-        toplam = round(toplam_full * oran, 2)
+        # toplam = arac + hizmet + km (hizmet attribution değiştiği için yeniden topla)
+        toplam = round(arac_gelir + hizmet_gelir + km_gelir, 2)
         days_in_period = round(overlap_days, 1)
 
         if not agg.get(vid):
